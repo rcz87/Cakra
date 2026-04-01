@@ -15,17 +15,19 @@ pub struct WalletInfo {
 pub fn build_wallet_message(wallets: &[WalletInfo]) -> (String, InlineKeyboardMarkup) {
     let mut text = String::from(
         "\u{1f45b} <b>Wallet Management</b>\n\
-         \u{2501}\u{2501}\u{2501}\u{2501}\u{2501}\u{2501}\u{2501}\u{2501}\u{2501}\u{2501}\u{2501}\u{2501}\u{2501}\u{2501}\u{2501}\u{2501}\u{2501}\u{2501}\u{2501}\u{2501}\n\n",
+         \u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\n\n",
     );
 
     if wallets.is_empty() {
         text.push_str(
-            "\u{26a0}\u{fe0f} Belum ada wallet.\n\
-             Generate wallet baru atau import existing wallet.\n",
+            "\u{26a0}\u{fe0f} <b>Belum ada wallet</b>\n\n\
+             Buat wallet baru atau import private key\n\
+             untuk mulai trading.\n\n\
+             \u{1f447} <i>Pilih aksi:</i>",
         );
     } else {
         for w in wallets {
-            let active = if w.is_active { " \u{2705} ACTIVE" } else { "" };
+            let active_badge = if w.is_active { " \u{2705}" } else { "" };
             let default_label = format!("Wallet #{}", w.index);
             let label = w
                 .label
@@ -38,38 +40,38 @@ pub fn build_wallet_message(wallets: &[WalletInfo]) -> (String, InlineKeyboardMa
             };
 
             text.push_str(&format!(
-                "\u{1f4cd} <b>{}</b>{}\n\
+                "{} <b>{}</b>{}\n\
                  \u{1f4cb} <code>{}</code>\n\
-                 \u{1f4b0} Balance: <b>{:.4} SOL</b>\n\n",
-                label, active, short_addr, w.balance_sol,
+                 \u{1f4b0} {:.4} SOL\n\n",
+                if w.is_active { "\u{1f7e2}" } else { "\u{26ab}" },
+                label, active_badge, short_addr, w.balance_sol,
             ));
         }
+        text.push_str("\u{1f447} <i>Pilih aksi:</i>");
     }
-
-    text.push_str("<i>Pilih aksi di bawah:</i>");
 
     let mut rows: Vec<Vec<InlineKeyboardButton>> = Vec::new();
 
     // Action buttons
     rows.push(vec![
-        InlineKeyboardButton::callback("\u{2728} Generate New", "wallet:generate"),
-        InlineKeyboardButton::callback("\u{1f4e5} Import", "wallet:import"),
+        InlineKeyboardButton::callback("\u{2728} Generate Baru", "wallet:generate"),
+        InlineKeyboardButton::callback("\u{1f4e5} Import Key", "wallet:import"),
     ]);
 
     if !wallets.is_empty() {
         rows.push(vec![
-            InlineKeyboardButton::callback("\u{1f504} Switch Active", "wallet:switch"),
-            InlineKeyboardButton::callback("\u{1f5d1}\u{fe0f} Delete", "wallet:delete"),
+            InlineKeyboardButton::callback("\u{1f504} Switch Wallet", "wallet:switch"),
+            InlineKeyboardButton::callback("\u{1f4cb} Deposit Address", "wallet:show_address"),
         ]);
-        rows.push(vec![InlineKeyboardButton::callback(
-            "\u{1f4cb} Show Address (Deposit)",
-            "wallet:show_address",
-        )]);
+        rows.push(vec![
+            InlineKeyboardButton::callback("\u{1f4b8} Withdraw SOL", "wallet:withdraw"),
+            InlineKeyboardButton::callback("\u{1f5d1}\u{fe0f} Hapus Wallet", "wallet:delete"),
+        ]);
     }
 
     // Back
     rows.push(vec![InlineKeyboardButton::callback(
-        "\u{2b05}\u{fe0f} Kembali",
+        "\u{2b05}\u{fe0f} Menu Utama",
         "menu",
     )]);
 

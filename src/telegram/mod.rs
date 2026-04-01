@@ -13,11 +13,26 @@ pub use bot::Command;
 
 use anyhow::Result;
 use teloxide::prelude::*;
+use std::collections::HashMap;
 use std::sync::Arc;
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, Mutex};
 
 use crate::config::Config;
 use crate::db::DbPool;
+use crate::executor::ExecutorService;
+use crate::wallet::WalletManager;
+
+/// What the bot is waiting for from the user.
+#[derive(Debug, Clone)]
+pub enum PendingAction {
+    EditSlippage,
+    EditTakeProfit,
+    EditStopLoss,
+    EditTrailingStop,
+    EditAutoBuyAmount,
+    EditMinScore,
+    ImportWallet,
+}
 
 /// Shared state passed to all handlers.
 #[derive(Clone)]
@@ -26,13 +41,28 @@ pub struct BotState {
     pub db: DbPool,
     /// Channel to dispatch sell commands (mint, sell_pct) to the sell executor.
     pub sell_tx: mpsc::Sender<(String, u8)>,
+    /// Wallet manager for generate/import/list wallets.
+    pub wallet_manager: Arc<WalletManager>,
+    /// Wallet password for encryption operations.
+    pub wallet_password: String,
+    /// Executor service for buy/sell operations.
+    pub executor: Arc<ExecutorService>,
+    /// Per-chat pending action (waiting for user input).
+    pub pending_actions: Arc<Mutex<HashMap<i64, PendingAction>>>,
 }
 
 pub struct TelegramBot;
 
 impl TelegramBot {
     /// Start the Telegram bot, register all handlers, and begin polling.
-    pub async fn start(config: Config, db: DbPool, sell_tx: mpsc::Sender<(String, u8)>) -> Result<()> {
+    pub async fn start(
+        config: Config,
+        db: DbPool,
+        sell_tx: mpsc::Sender<(String, u8)>,
+        wallet_manager: Arc<WalletManager>,
+        wallet_password: String,
+        executor: Arc<ExecutorService>,
+    ) -> Result<()> {
         tracing::info!("Starting RICOZ SNIPER Telegram bot...");
 
         let bot = Bot::new(&config.telegram_bot_token);
@@ -40,6 +70,10 @@ impl TelegramBot {
             config: config.clone(),
             db,
             sell_tx,
+            wallet_manager,
+            wallet_password,
+            executor,
+            pending_actions: Arc::new(Mutex::new(HashMap::new())),
         });
 
         let handler = dptree::entry()

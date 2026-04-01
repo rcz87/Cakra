@@ -1,63 +1,58 @@
-use anyhow::Result;
 use teloxide::types::{InlineKeyboardButton, InlineKeyboardMarkup};
 
 /// Build the buy-amount selection keyboard for a given token mint.
 pub fn build_buy_keyboard(mint: &str) -> InlineKeyboardMarkup {
     InlineKeyboardMarkup::new(vec![
-        // Row 1: preset amounts
+        // Row 1: small amounts
         vec![
             InlineKeyboardButton::callback(
-                "\u{25aa}\u{fe0f} 0.1 SOL",
-                format!("buy:0.1:{}", mint),
+                "0.01 SOL",
+                format!("buy:0.01:{}", mint),
             ),
             InlineKeyboardButton::callback(
-                "\u{25ab}\u{fe0f} 0.5 SOL",
+                "0.05 SOL",
+                format!("buy:0.05:{}", mint),
+            ),
+            InlineKeyboardButton::callback(
+                "0.1 SOL",
+                format!("buy:0.1:{}", mint),
+            ),
+        ],
+        // Row 2: medium amounts
+        vec![
+            InlineKeyboardButton::callback(
+                "0.25 SOL",
+                format!("buy:0.25:{}", mint),
+            ),
+            InlineKeyboardButton::callback(
+                "0.5 SOL",
                 format!("buy:0.5:{}", mint),
             ),
             InlineKeyboardButton::callback(
-                "\u{1f7e1} 1 SOL",
+                "1.0 SOL",
                 format!("buy:1:{}", mint),
             ),
         ],
-        // Row 2: custom + cancel
+        // Row 3: large amounts
         vec![
+            InlineKeyboardButton::callback(
+                "2.0 SOL",
+                format!("buy:2:{}", mint),
+            ),
+            InlineKeyboardButton::callback(
+                "5.0 SOL",
+                format!("buy:5:{}", mint),
+            ),
             InlineKeyboardButton::callback(
                 "\u{270f}\u{fe0f} Custom",
                 format!("buy_custom:{}", mint),
             ),
-            InlineKeyboardButton::callback("\u{274c} Cancel", "cancel"),
+        ],
+        // Row 4: cancel
+        vec![
+            InlineKeyboardButton::callback("\u{274c} Batal", "cancel"),
+            InlineKeyboardButton::callback("\u{2b05}\u{fe0f} Menu Utama", "menu"),
         ],
     ])
 }
 
-/// Execute a buy for the given amount and token mint.
-/// Returns Ok on success, Err on failure. The actual execution is delegated
-/// to the executor module.
-pub async fn handle_buy_callback(amount_sol: f64, mint: &str) -> Result<()> {
-    tracing::info!(
-        "Buy callback: {} SOL for mint {}",
-        amount_sol,
-        mint
-    );
-
-    // Validate amount
-    if amount_sol <= 0.0 {
-        anyhow::bail!("Amount harus > 0");
-    }
-
-    if amount_sol > 10.0 {
-        anyhow::bail!("Amount terlalu besar (max 10 SOL per trade)");
-    }
-
-    // TODO: Call executor::execute_buy(mint, amount_sol).await
-    // TODO: Record trade in DB
-    // TODO: Create position entry
-
-    tracing::info!(
-        "Buy order queued: {} SOL -> {}",
-        amount_sol,
-        mint
-    );
-
-    Ok(())
-}

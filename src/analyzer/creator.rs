@@ -7,7 +7,7 @@ use std::collections::HashMap;
 use std::str::FromStr;
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
-use tracing::{info, warn};
+use tracing::info;
 
 use crate::models::token::CreatorHistory;
 

@@ -12,7 +12,7 @@ pub mod socials;
 
 use anyhow::Result;
 use solana_client::rpc_client::RpcClient;
-use tracing::{error, info, warn};
+use tracing::{info, warn};
 
 use crate::config::Config;
 use crate::models::token::{SecurityAnalysis, TokenInfo};

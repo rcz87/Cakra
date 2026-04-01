@@ -119,7 +119,7 @@ impl JitoClient {
     }
 
     /// Pick a random Jito tip account and build a SOL transfer instruction to it.
-    pub fn build_tip_instruction(payer: &Pubkey, tip_lamports: u64) -> Result<()> {
+    pub fn build_tip_instruction(_payer: &Pubkey, _tip_lamports: u64) -> Result<()> {
         // Kept for backward compat — use build_tip_tx() instead.
         let _ = Self::random_tip_account()?;
         Ok(())

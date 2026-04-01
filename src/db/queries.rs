@@ -102,8 +102,16 @@ pub fn add_blacklist(db: &DbPool, mint: &str, reason: Option<&str>) -> Result<()
 
 pub fn insert_trade(db: &DbPool, trade: &Trade) -> Result<()> {
     let conn = db.lock().unwrap();
-    let trade_type = serde_json::to_string(&trade.trade_type)?;
-    let status = serde_json::to_string(&trade.status)?;
+    let trade_type = match trade.trade_type {
+        crate::models::trade::TradeType::Buy => "Buy",
+        crate::models::trade::TradeType::Sell => "Sell",
+    };
+    let status = match trade.status {
+        crate::models::trade::TradeStatus::Pending => "Pending",
+        crate::models::trade::TradeStatus::Submitted => "Submitted",
+        crate::models::trade::TradeStatus::Confirmed => "Confirmed",
+        crate::models::trade::TradeStatus::Failed => "Failed",
+    };
     conn.execute(
         "INSERT INTO trades (id, token_mint, token_symbol, trade_type, amount_sol, amount_tokens, price_per_token, slippage_bps, tx_signature, status, wallet_pubkey, created_at, confirmed_at, pnl_sol, security_score)
          VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)",
@@ -140,31 +148,66 @@ pub fn update_trade_status(db: &DbPool, trade_id: &str, status: &str, tx_sig: Op
 pub fn get_recent_trades(db: &DbPool, limit: u32) -> Result<Vec<Trade>> {
     let conn = db.lock().unwrap();
     let mut stmt = conn.prepare(
-        "SELECT id, token_mint, token_symbol, trade_type, amount_sol, amount_tokens, price_per_token, slippage_bps, tx_signature, status, wallet_pubkey, created_at, pnl_sol, security_score
+        "SELECT id, token_mint, token_symbol, trade_type, amount_sol, amount_tokens, \
+         price_per_token, slippage_bps, tx_signature, status, wallet_pubkey, \
+         created_at, confirmed_at, pnl_sol, security_score \
          FROM trades ORDER BY created_at DESC LIMIT ?1"
     )?;
     let rows = stmt.query_map(params![limit], |row| {
+        let trade_type_str: String = row.get(3)?;
+        let status_str: String = row.get(9)?;
+        let created_str: String = row.get(11)?;
+        let confirmed_str: Option<String> = row.get(12)?;
+
         Ok(Trade {
             id: row.get(0)?,
             token_mint: row.get(1)?,
             token_symbol: row.get(2)?,
-            trade_type: serde_json::from_str(&row.get::<_, String>(3)?).unwrap_or(crate::models::trade::TradeType::Buy),
+            trade_type: parse_trade_type(&trade_type_str),
             amount_sol: row.get(4)?,
             amount_tokens: row.get(5)?,
             price_per_token: row.get(6)?,
             slippage_bps: row.get(7)?,
             tx_signature: row.get(8)?,
-            status: serde_json::from_str(&row.get::<_, String>(9)?).unwrap_or(crate::models::trade::TradeStatus::Pending),
+            status: parse_trade_status(&status_str),
             wallet_pubkey: row.get(10)?,
-            created_at: chrono::DateTime::parse_from_rfc3339(&row.get::<_, String>(11)?)
+            created_at: chrono::DateTime::parse_from_rfc3339(&created_str)
                 .unwrap_or_default()
                 .with_timezone(&chrono::Utc),
-            confirmed_at: None,
-            pnl_sol: row.get(12)?,
-            security_score: row.get(13)?,
+            confirmed_at: confirmed_str
+                .and_then(|s| chrono::DateTime::parse_from_rfc3339(&s).ok())
+                .map(|dt| dt.with_timezone(&chrono::Utc)),
+            pnl_sol: row.get(13)?,
+            security_score: row.get(14)?,
         })
     })?;
     Ok(rows.filter_map(|r| r.ok()).collect())
+}
+
+fn parse_trade_type(s: &str) -> crate::models::trade::TradeType {
+    use crate::models::trade::TradeType;
+    match s {
+        "Buy" => TradeType::Buy,
+        "Sell" => TradeType::Sell,
+        // Handle JSON-quoted legacy values
+        s if s.contains("Buy") => TradeType::Buy,
+        _ => TradeType::Sell,
+    }
+}
+
+fn parse_trade_status(s: &str) -> crate::models::trade::TradeStatus {
+    use crate::models::trade::TradeStatus;
+    match s {
+        "Pending" => TradeStatus::Pending,
+        "Submitted" => TradeStatus::Submitted,
+        "Confirmed" => TradeStatus::Confirmed,
+        "Failed" => TradeStatus::Failed,
+        // Handle JSON-quoted legacy values
+        s if s.contains("Confirmed") => TradeStatus::Confirmed,
+        s if s.contains("Failed") => TradeStatus::Failed,
+        s if s.contains("Submitted") => TradeStatus::Submitted,
+        _ => TradeStatus::Pending,
+    }
 }
 
 pub fn get_daily_pnl(db: &DbPool) -> Result<f64> {
@@ -182,7 +225,13 @@ pub fn get_daily_pnl(db: &DbPool) -> Result<f64> {
 
 pub fn insert_position(db: &DbPool, pos: &Position) -> Result<()> {
     let conn = db.lock().unwrap();
-    let status = serde_json::to_string(&pos.status)?;
+    let status = match pos.status {
+        crate::models::position::PositionStatus::Open => "Open",
+        crate::models::position::PositionStatus::ClosedTp => "ClosedTp",
+        crate::models::position::PositionStatus::ClosedSl => "ClosedSl",
+        crate::models::position::PositionStatus::ClosedManual => "ClosedManual",
+        crate::models::position::PositionStatus::ClosedError => "ClosedError",
+    };
     conn.execute(
         "INSERT INTO positions (id, token_mint, token_symbol, wallet_pubkey, entry_price_sol, entry_amount_sol, token_amount, current_price_sol, highest_price_sol, take_profit_pct, stop_loss_pct, trailing_stop_pct, pnl_sol, pnl_pct, status, buy_tx, sell_tx, opened_at, closed_at)
          VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19)",
@@ -203,10 +252,18 @@ pub fn insert_position(db: &DbPool, pos: &Position) -> Result<()> {
 pub fn get_open_positions(db: &DbPool) -> Result<Vec<Position>> {
     let conn = db.lock().unwrap();
     let mut stmt = conn.prepare(
-        "SELECT id, token_mint, token_symbol, wallet_pubkey, entry_price_sol, entry_amount_sol, token_amount, current_price_sol, highest_price_sol, take_profit_pct, stop_loss_pct, trailing_stop_pct, pnl_sol, pnl_pct, buy_tx, opened_at, security_score
+        "SELECT id, token_mint, token_symbol, wallet_pubkey, entry_price_sol, \
+         entry_amount_sol, token_amount, current_price_sol, highest_price_sol, \
+         take_profit_pct, stop_loss_pct, trailing_stop_pct, pnl_sol, pnl_pct, \
+         status, buy_tx, sell_tx, opened_at, closed_at, security_score \
          FROM positions WHERE status = 'Open' ORDER BY opened_at DESC"
     )?;
     let rows = stmt.query_map([], |row| {
+        let status_str: String = row.get(14)?;
+        let status = parse_position_status(&status_str);
+        let opened_str: String = row.get(17)?;
+        let closed_str: Option<String> = row.get(18)?;
+
         Ok(Position {
             id: row.get(0)?,
             token_mint: row.get(1)?,
@@ -222,18 +279,33 @@ pub fn get_open_positions(db: &DbPool) -> Result<Vec<Position>> {
             trailing_stop_pct: row.get(11)?,
             pnl_sol: row.get(12)?,
             pnl_pct: row.get(13)?,
-            status: crate::models::position::PositionStatus::Open,
-            buy_tx: row.get(14)?,
-            sell_tx: None,
-            opened_at: chrono::DateTime::parse_from_rfc3339(&row.get::<_, String>(15)?)
+            status,
+            buy_tx: row.get(15)?,
+            sell_tx: row.get(16)?,
+            opened_at: chrono::DateTime::parse_from_rfc3339(&opened_str)
                 .unwrap_or_default()
                 .with_timezone(&chrono::Utc),
-            closed_at: None,
-            security_score: row.get::<_, Option<u8>>(16)?.unwrap_or(0),
+            closed_at: closed_str
+                .and_then(|s| chrono::DateTime::parse_from_rfc3339(&s).ok())
+                .map(|dt| dt.with_timezone(&chrono::Utc)),
+            security_score: row.get::<_, Option<u8>>(19)?.unwrap_or(0),
             age_secs: 0,
         })
     })?;
     Ok(rows.filter_map(|r| r.ok()).collect())
+}
+
+/// Parse a status string from DB into PositionStatus enum.
+fn parse_position_status(s: &str) -> crate::models::position::PositionStatus {
+    use crate::models::position::PositionStatus;
+    match s {
+        "Open" => PositionStatus::Open,
+        "ClosedTp" => PositionStatus::ClosedTp,
+        "ClosedSl" => PositionStatus::ClosedSl,
+        "ClosedManual" => PositionStatus::ClosedManual,
+        "ClosedError" => PositionStatus::ClosedError,
+        _ => PositionStatus::Open, // fallback
+    }
 }
 
 pub fn close_position(db: &DbPool, position_id: &str, status: &str, sell_tx: &str, pnl_sol: f64) -> Result<()> {

@@ -319,7 +319,13 @@ impl PositionManager {
                     trailing_stop_pct: row.get(11)?,
                     pnl_sol: row.get(12)?,
                     pnl_pct: row.get(13)?,
-                    status: PositionStatus::Open,
+                    status: match row.get::<_, String>(14).unwrap_or_default().as_str() {
+                        "ClosedTp" => PositionStatus::ClosedTp,
+                        "ClosedSl" => PositionStatus::ClosedSl,
+                        "ClosedManual" => PositionStatus::ClosedManual,
+                        "ClosedError" => PositionStatus::ClosedError,
+                        _ => PositionStatus::Open,
+                    },
                     buy_tx: row.get(15)?,
                     sell_tx: row.get(16)?,
                     opened_at: row.get::<_, String>(17)
@@ -327,7 +333,10 @@ impl PositionManager {
                         .and_then(|s| chrono::DateTime::parse_from_rfc3339(&s).ok())
                         .map(|dt| dt.with_timezone(&Utc))
                         .unwrap_or_else(Utc::now),
-                    closed_at: None,
+                    closed_at: row.get::<_, String>(18)
+                        .ok()
+                        .and_then(|s| chrono::DateTime::parse_from_rfc3339(&s).ok())
+                        .map(|dt| dt.with_timezone(&Utc)),
                     security_score: row.get::<_, u32>(19).unwrap_or(0) as u8,
                     age_secs: 0,
                 })

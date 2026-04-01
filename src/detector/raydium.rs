@@ -82,8 +82,8 @@ fn parse_initialize2_fields(data: &[u8], accounts: &[String]) -> Result<TokenInf
     // init_pc_amount (quote/SOL amount): u64 at offset 10
     let init_pc_amount = parser::extract_u64_le(data, 10)?;
 
-    // init_coin_amount (base token amount): u64 at offset 18
-    let _init_coin_amount = parser::extract_u64_le(data, 18)?;
+    // init_coin_amount (base/coin amount): u64 at offset 18
+    let init_coin_amount = parser::extract_u64_le(data, 18)?;
 
     // Extract accounts
     let pool_address = accounts.get(3).cloned().unwrap_or_default();
@@ -92,9 +92,10 @@ fn parse_initialize2_fields(data: &[u8], accounts: &[String]) -> Result<TokenInf
     let user_wallet = accounts.get(16).cloned().unwrap_or_default();
 
     // Determine which mint is the new token (the non-SOL side)
+    // Raydium convention: coin = base, pc = quote
     let (token_mint, initial_sol_lamports) = if coin_mint == WSOL_MINT {
-        // SOL is the base; the new token is the quote
-        (pc_mint, _init_coin_amount)
+        // SOL is on the coin (base) side → SOL amount = init_coin_amount
+        (pc_mint, init_coin_amount)
     } else if pc_mint == WSOL_MINT {
         // SOL is the quote; the new token is the base
         (coin_mint, init_pc_amount)

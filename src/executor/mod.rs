@@ -142,7 +142,10 @@ impl ExecutorService {
         .await
         .context("Failed to get Jupiter quote")?;
 
-        let expected_output: u64 = quote.out_amount.parse().unwrap_or(0);
+        let expected_output: u64 = quote
+            .out_amount
+            .parse()
+            .context("Failed to parse Jupiter out_amount")?;
         info!(
             expected_output = expected_output,
             slippage_bps = slippage_bps,

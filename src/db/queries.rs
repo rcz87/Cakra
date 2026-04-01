@@ -204,7 +204,7 @@ pub fn get_open_positions(db: &DbPool) -> Result<Vec<Position>> {
     let conn = db.lock().unwrap();
     let mut stmt = conn.prepare(
         "SELECT id, token_mint, token_symbol, wallet_pubkey, entry_price_sol, entry_amount_sol, token_amount, current_price_sol, highest_price_sol, take_profit_pct, stop_loss_pct, trailing_stop_pct, pnl_sol, pnl_pct, buy_tx, opened_at, security_score
-         FROM positions WHERE status = '\"Open\"' ORDER BY opened_at DESC"
+         FROM positions WHERE status = 'Open' ORDER BY opened_at DESC"
     )?;
     let rows = stmt.query_map([], |row| {
         Ok(Position {

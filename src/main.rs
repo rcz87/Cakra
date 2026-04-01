@@ -85,6 +85,9 @@ async fn main() -> Result<()> {
 
     // ── Wallet Manager (shared for buy/sell) ─────────────────────
     let wallet_password = std::env::var("WALLET_PASSWORD").unwrap_or_default();
+    if wallet_password.is_empty() {
+        warn!("WALLET_PASSWORD is not set — wallet operations will fail. Set it in .env or environment.");
+    }
     let wallet_manager = Arc::new(
         WalletManager::new(&config, db.clone()).expect("Failed to create wallet manager"),
     );

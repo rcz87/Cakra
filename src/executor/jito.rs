@@ -182,7 +182,7 @@ impl JitoClient {
             "Submitting Jito bundle (last tx = tip)"
         );
 
-        // Serialize all transactions to base58 (Jito expects base58 for sendBundle)
+        // Serialize all transactions to base64 (Jito expects base64 for sendBundle)
         let encoded_txs: Vec<String> = bundle
             .iter()
             .map(|tx| {

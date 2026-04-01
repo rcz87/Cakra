@@ -1,6 +1,7 @@
 pub mod jito;
 pub mod jupiter;
 pub mod positions;
+pub mod price_feed;
 pub mod priority;
 pub mod pumpfun_buy;
 pub mod raydium;
@@ -21,6 +22,7 @@ use tracing::{error, info, warn};
 use crate::config::Config;
 use crate::db::DbPool;
 use crate::models::token::{TokenInfo, TokenSource};
+use crate::risk::{RiskManager, CooldownManager, ListManager, RiskCheck};
 
 use self::jito::JitoClient;
 use self::jupiter::JupiterClient;
@@ -41,10 +43,19 @@ pub struct ExecutorService {
     pub jupiter: JupiterClient,
     pub positions: PositionManager,
     pub db: DbPool,
+    pub risk: RiskManager,
+    pub cooldown: CooldownManager,
+    pub lists: ListManager,
 }
 
 impl ExecutorService {
-    pub fn new(config: Arc<Config>, db: DbPool) -> Self {
+    pub fn new(
+        config: Arc<Config>,
+        db: DbPool,
+        risk: RiskManager,
+        cooldown: CooldownManager,
+        lists: ListManager,
+    ) -> Self {
         let rpc = Arc::new(RpcClient::new(config.effective_rpc_url().to_string()));
         let jito = JitoClient::new(&config.jito_block_engine_url);
         let jupiter = JupiterClient::new(&config.jupiter_api_url);
@@ -57,6 +68,9 @@ impl ExecutorService {
             jupiter,
             positions,
             db,
+            risk,
+            cooldown,
+            lists,
         }
     }
 
@@ -75,6 +89,27 @@ impl ExecutorService {
             slippage_bps = slippage_bps,
             "Executing buy"
         );
+
+        // Check blacklist
+        if self.lists.is_blacklisted(&token.mint)? {
+            anyhow::bail!("Token {} is blacklisted", token.mint);
+        }
+
+        // Risk manager check
+        match self.risk.can_trade(amount_sol)? {
+            RiskCheck::Denied(reason) => {
+                anyhow::bail!("Risk check denied: {}", reason);
+            }
+            RiskCheck::Allowed => {}
+        }
+
+        // Cooldown check
+        if !self.cooldown.can_trade(&wallet.pubkey().to_string()) {
+            anyhow::bail!(
+                "Wallet {} is on trade cooldown",
+                wallet.pubkey()
+            );
+        }
 
         // Validate amount against risk limits
         if amount_sol > self.config.max_buy_sol {
@@ -147,6 +182,12 @@ impl ExecutorService {
 
         info!(signature = %signature, "Buy transaction submitted");
 
+        // Confirm the bundle landed on-chain before creating a position
+        let confirmed = self.jito.confirm_bundle(&signature, 30).await?;
+        if !confirmed {
+            anyhow::bail!("Transaction not confirmed");
+        }
+
         // Track the new position
         let entry_price = if route.expected_output > 0 {
             amount_sol / (route.expected_output as f64)
@@ -164,6 +205,11 @@ impl ExecutorService {
             self.config.default_slippage_bps,
             &signature,
         )?;
+
+        // Record trade for cooldown tracking
+        self.cooldown.record_trade(&wallet.pubkey().to_string());
+
+        // TODO: validate_slippage post-transaction by comparing expected vs actual output on-chain
 
         Ok(signature)
     }

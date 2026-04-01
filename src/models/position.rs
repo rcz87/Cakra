@@ -32,6 +32,7 @@ pub struct Position {
     pub opened_at: DateTime<Utc>,
     pub closed_at: Option<DateTime<Utc>>,
     pub security_score: u8,
+    pub age_secs: u64,
 }
 
 impl Position {
@@ -44,6 +45,10 @@ impl Position {
         if self.entry_price_sol > 0.0 {
             self.pnl_pct = ((current_price / self.entry_price_sol) - 1.0) * 100.0;
         }
+    }
+
+    pub fn update_age(&mut self) {
+        self.age_secs = (chrono::Utc::now() - self.opened_at).num_seconds().max(0) as u64;
     }
 
     pub fn should_take_profit(&self) -> bool {

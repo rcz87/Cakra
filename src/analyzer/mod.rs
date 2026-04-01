@@ -1,9 +1,11 @@
 pub mod authority;
 pub mod creator;
+pub mod entry_confirmation;
 pub mod goplus;
 pub mod honeypot;
 pub mod liquidity;
 pub mod metadata;
+pub mod opportunity;
 pub mod rugcheck;
 pub mod scoring;
 pub mod socials;
@@ -16,7 +18,7 @@ use crate::config::Config;
 use crate::models::token::{SecurityAnalysis, TokenInfo};
 
 use self::authority::{check_freeze_authority, check_mint_authority};
-use self::creator::analyze_creator;
+use self::creator::{analyze_creator, CreatorCache};
 use self::goplus::check_goplus;
 use self::honeypot::simulate_honeypot;
 use self::liquidity::check_lp_status;
@@ -29,11 +31,15 @@ use self::socials::check_socials;
 /// Runs all security checks on a newly detected token and produces a final safety score.
 pub struct AnalyzerService {
     pub config: Config,
+    pub creator_cache: CreatorCache,
 }
 
 impl AnalyzerService {
     pub fn new(config: Config) -> Self {
-        Self { config }
+        Self {
+            config,
+            creator_cache: CreatorCache::new(3600), // 1 hour TTL
+        }
     }
 
     /// Run every security check against the given token and compute the final score.
@@ -98,10 +104,11 @@ impl AnalyzerService {
 
         // --- Honeypot simulation ---
         match simulate_honeypot(
-            rpc_client,
+            &self.config.jupiter_api_url,
             &token.mint,
-            token.pool_address.as_deref(),
-        ) {
+        )
+        .await
+        {
             Ok(result) => {
                 analysis.honeypot_result = result;
                 info!(mint = %token.mint, "Honeypot simulation complete");
@@ -136,7 +143,7 @@ impl AnalyzerService {
         }
 
         // --- Creator history ---
-        match analyze_creator(rpc_client, &token.creator) {
+        match analyze_creator(rpc_client, &token.creator, &self.creator_cache).await {
             Ok(history) => {
                 analysis.creator_history = history;
                 info!(mint = %token.mint, "Creator analysis complete");

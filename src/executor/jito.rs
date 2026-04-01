@@ -29,13 +29,19 @@ struct BundleStatusEntry {
     bundle_id: String,
     status: String,
     landed_slot: Option<u64>,
+    /// Transaction signatures included in the bundle (populated when Landed/Finalized).
+    transactions: Option<Vec<String>>,
 }
 
 /// Result of a bundle confirmation poll.
 #[derive(Debug, Clone)]
 pub enum BundleConfirmation {
     /// Bundle landed on-chain at the given slot.
-    Landed { slot: Option<u64> },
+    Landed {
+        slot: Option<u64>,
+        /// Transaction signatures from the bundle (first = swap tx, last = tip tx).
+        transactions: Vec<String>,
+    },
     /// Bundle was explicitly rejected by the block engine.
     Failed { status: String },
     /// Polling timed out without a terminal status.
@@ -45,6 +51,14 @@ pub enum BundleConfirmation {
 impl BundleConfirmation {
     pub fn is_landed(&self) -> bool {
         matches!(self, Self::Landed { .. })
+    }
+
+    /// Extract the first (swap) transaction signature, if the bundle landed.
+    pub fn swap_signature(&self) -> Option<&str> {
+        match self {
+            Self::Landed { transactions, .. } => transactions.first().map(|s| s.as_str()),
+            _ => None,
+        }
     }
 }
 
@@ -277,15 +291,18 @@ impl JitoClient {
                                 if entry.bundle_id == bundle_id {
                                     match entry.status.as_str() {
                                         "Landed" | "Finalized" => {
+                                            let txs = entry.transactions.clone().unwrap_or_default();
                                             info!(
                                                 bundle_id = %bundle_id,
                                                 status = %entry.status,
                                                 landed_slot = ?entry.landed_slot,
+                                                tx_count = txs.len(),
                                                 attempts = attempts,
                                                 "Bundle confirmed on-chain"
                                             );
                                             return Ok(BundleConfirmation::Landed {
                                                 slot: entry.landed_slot,
+                                                transactions: txs,
                                             });
                                         }
                                         "Failed" | "Invalid" => {

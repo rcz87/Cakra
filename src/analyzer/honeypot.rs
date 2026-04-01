@@ -64,8 +64,8 @@ pub async fn simulate_honeypot(
             return Ok(HoneypotResult::Honeypot);
         }
         Err(e) => {
-            warn!(mint = %mint, err = %e, "Buy quote request failed");
-            return Ok(HoneypotResult::Unknown);
+            warn!(mint = %mint, err = %e, "Buy quote request failed — treating as potential honeypot");
+            return Ok(HoneypotResult::Honeypot);
         }
     };
 

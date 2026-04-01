@@ -17,7 +17,7 @@ use solana_sdk::pubkey::Pubkey;
 use solana_sdk::signer::keypair::Keypair;
 use solana_sdk::signer::Signer;
 use solana_sdk::transaction::Transaction;
-use tracing::info;
+use tracing::{info, warn};
 
 use crate::config::Config;
 use crate::db::DbPool;
@@ -50,11 +50,11 @@ impl ExecutorService {
         risk: RiskManager,
         cooldown: CooldownManager,
         lists: ListManager,
+        positions: PositionManager,
     ) -> Self {
         let rpc = Arc::new(RpcClient::new(config.effective_rpc_url().to_string()));
         let jito = JitoClient::new(&config.jito_block_engine_url);
         let jupiter = JupiterClient::new(&config.jupiter_api_url, &config.jupiter_api_key);
-        let positions = PositionManager::new(db.clone());
 
         Self {
             config,
@@ -217,17 +217,53 @@ impl ExecutorService {
             );
         }
 
-        let signature = bundle_id.clone();
+        // Extract real transaction signature (not bundle ID)
+        let signature = confirmation
+            .swap_signature()
+            .unwrap_or(&bundle_id)
+            .to_string();
 
-        info!(
-            bundle_id = %bundle_id,
-            expected_output = expected_output,
-            "Buy confirmed via Jito bundle"
+        // 6. Verify actual on-chain token balance (not quote estimate)
+        let mint_pubkey: Pubkey = token.mint.parse().context("Invalid mint")?;
+        let token_program: Pubkey = "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA"
+            .parse()
+            .unwrap();
+        let ata_program: Pubkey = "ATokenGPvbdGVxr1b2hvZbsiqW5xWH25efTNsLJA8knL"
+            .parse()
+            .unwrap();
+        let (ata, _) = Pubkey::find_program_address(
+            &[
+                wallet.pubkey().as_ref(),
+                token_program.as_ref(),
+                mint_pubkey.as_ref(),
+            ],
+            &ata_program,
         );
 
-        // Track the position using expected output from quote
-        let entry_price = if expected_output > 0 {
-            amount_sol / (expected_output as f64)
+        // Try to get actual balance; fall back to expected if ATA doesn't exist yet
+        let actual_output = match self.rpc.get_token_account_balance(&ata) {
+            Ok(balance) => {
+                let bal: u64 = balance.amount.parse().unwrap_or(0);
+                if bal > 0 { bal } else { expected_output }
+            }
+            Err(_) => {
+                warn!(
+                    mint = %token.mint,
+                    "Could not verify on-chain balance after buy, using expected output"
+                );
+                expected_output
+            }
+        };
+
+        info!(
+            signature = %signature,
+            expected_output = expected_output,
+            actual_output = actual_output,
+            "Buy confirmed — position tracked with actual balance"
+        );
+
+        let entry_price = if actual_output > 0 {
+            amount_sol / (actual_output as f64)
         } else {
             0.0
         };
@@ -238,7 +274,7 @@ impl ExecutorService {
             &taker,
             entry_price,
             amount_sol,
-            expected_output as f64,
+            actual_output as f64,
             self.config.default_slippage_bps,
             &signature,
             0, // security_score: caller can override when available
@@ -394,19 +430,45 @@ impl ExecutorService {
             );
         }
 
-        let signature = bundle_id.clone();
+        // Extract real transaction signature (not bundle ID)
+        let signature = confirmation
+            .swap_signature()
+            .unwrap_or(&bundle_id)
+            .to_string();
+
+        // 6. Verify sell actually reduced on-chain balance
+        let post_balance = match self.rpc.get_token_account_balance(&ata) {
+            Ok(b) => b.amount.parse::<u64>().unwrap_or(0),
+            Err(_) => 0, // ATA closed = balance is 0 (full sell)
+        };
+
+        if post_balance >= total_amount {
+            anyhow::bail!(
+                "Sell did NOT reduce on-chain balance for mint {} (pre: {}, post: {}). \
+                 Swap may have reverted on-chain.",
+                mint,
+                total_amount,
+                post_balance
+            );
+        }
+
+        let actual_sold = total_amount - post_balance;
+        let actual_sell_pct = ((actual_sold as f64 / total_amount as f64) * 100.0) as u8;
 
         info!(
-            bundle_id = %bundle_id,
+            signature = %signature,
             expected_sol = %quote.out_amount,
-            "Sell confirmed via Jito bundle"
+            pre_balance = total_amount,
+            post_balance = post_balance,
+            actual_sold = actual_sold,
+            "Sell confirmed — balance verified on-chain"
         );
 
-        // Update position tracking
-        if amount_pct >= 100 {
+        // Update position tracking based on actual sell
+        if post_balance == 0 {
             self.positions.close_position(mint, &signature)?;
         } else {
-            self.positions.reduce_position(mint, amount_pct, &signature)?;
+            self.positions.reduce_position(mint, actual_sell_pct, &signature)?;
         }
 
         Ok(signature)

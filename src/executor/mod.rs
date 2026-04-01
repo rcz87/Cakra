@@ -59,7 +59,7 @@ impl ExecutorService {
     ) -> Self {
         let rpc = Arc::new(RpcClient::new(config.effective_rpc_url().to_string()));
         let jito = JitoClient::new(&config.jito_block_engine_url);
-        let jupiter = JupiterClient::new(&config.jupiter_api_url);
+        let jupiter = JupiterClient::new(&config.jupiter_api_url, &config.jupiter_api_key);
         let positions = PositionManager::new(db.clone());
 
         Self {

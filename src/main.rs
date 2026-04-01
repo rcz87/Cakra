@@ -292,7 +292,7 @@ async fn main() -> Result<()> {
     });
 
     // ── Spawn Price Feed ───────────────────────────────────────
-    let price_feed = PriceFeed::new(&config.jupiter_api_url, 3);
+    let price_feed = PriceFeed::new(&config.jupiter_api_url, &config.jupiter_api_key, 3);
     let price_positions = position_manager.clone();
     let mut price_shutdown = shutdown_tx.subscribe();
     let price_handle = tokio::spawn(async move {

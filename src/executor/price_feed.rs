@@ -14,14 +14,16 @@ struct JupiterQuoteResponse {
 
 pub struct PriceFeed {
     jupiter_api_url: String,
+    jupiter_api_key: String,
     http: reqwest::Client,
     poll_interval: Duration,
 }
 
 impl PriceFeed {
-    pub fn new(jupiter_api_url: &str, poll_interval_secs: u64) -> Self {
+    pub fn new(jupiter_api_url: &str, jupiter_api_key: &str, poll_interval_secs: u64) -> Self {
         Self {
             jupiter_api_url: jupiter_api_url.trim_end_matches('/').to_string(),
+            jupiter_api_key: jupiter_api_key.to_string(),
             http: reqwest::Client::new(),
             poll_interval: Duration::from_secs(if poll_interval_secs == 0 {
                 3
@@ -57,7 +59,7 @@ impl PriceFeed {
             for position in &open_positions {
                 let mint = &position.token_mint;
 
-                match get_token_price(&self.http, &self.jupiter_api_url, mint).await {
+                match get_token_price(&self.http, &self.jupiter_api_url, &self.jupiter_api_key, mint).await {
                     Ok(price) => {
                         debug!(
                             mint = %mint,
@@ -89,6 +91,7 @@ impl PriceFeed {
 pub async fn get_token_price(
     http: &reqwest::Client,
     jupiter_url: &str,
+    api_key: &str,
     mint: &str,
 ) -> Result<f64> {
     let url = format!(
@@ -97,9 +100,11 @@ pub async fn get_token_price(
         mint,
     );
 
-    let resp = http
-        .get(&url)
-        .timeout(Duration::from_secs(5))
+    let mut req = http.get(&url).timeout(Duration::from_secs(5));
+    if !api_key.is_empty() {
+        req = req.header("x-api-key", api_key);
+    }
+    let resp = req
         .send()
         .await?
         .error_for_status()?

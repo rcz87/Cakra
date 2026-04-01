@@ -120,21 +120,26 @@ pub fn calculate_opportunity_score(analysis: &OpportunityAnalysis) -> u8 {
     final_score
 }
 
+/// SOL wrapped mint for Price API V3 queries.
+const SOL_MINT: &str = "So11111111111111111111111111111111111111112";
+
 /// In-memory ring buffer that stores periodic SOL price samples
 /// and calculates the 1-hour trend.
 #[derive(Clone)]
 pub struct SolTrendTracker {
     prices: Arc<Mutex<VecDeque<(Instant, f64)>>>,
     max_samples: usize,
+    api_key: String,
 }
 
 impl SolTrendTracker {
     /// Create a new tracker with an empty buffer.
     /// Default capacity is 120 samples (one per 30 seconds for 1 hour).
-    pub fn new() -> Self {
+    pub fn new(api_key: &str) -> Self {
         Self {
             prices: Arc::new(Mutex::new(VecDeque::with_capacity(120))),
             max_samples: 120,
+            api_key: api_key.to_string(),
         }
     }
 
@@ -176,15 +181,16 @@ impl SolTrendTracker {
         ((newest_price - oldest_price) / oldest_price) * 100.0
     }
 
-    /// Fetch the current SOL price from Jupiter, record it, and return the price.
+    /// Fetch the current SOL price from Jupiter Price API V3, record it, and return the price.
     pub async fn fetch_and_record(&self) -> Result<f64> {
         let http = reqwest::Client::new();
 
-        let resp = http
-            .get("https://price.jup.ag/v6/price?ids=SOL&vsToken=USDC")
-            .timeout(Duration::from_secs(5))
-            .send()
-            .await?;
+        let url = format!("https://api.jup.ag/price/v3?ids={}", SOL_MINT);
+        let mut req = http.get(&url).timeout(Duration::from_secs(5));
+        if !self.api_key.is_empty() {
+            req = req.header("x-api-key", &self.api_key);
+        }
+        let resp = req.send().await?;
 
         #[derive(Deserialize)]
         struct PriceResponse {
@@ -192,11 +198,15 @@ impl SolTrendTracker {
         }
         #[derive(Deserialize)]
         struct PriceData {
-            price: f64,
+            price: String,
         }
 
         let price_resp: PriceResponse = resp.json().await?;
-        let current_price = price_resp.data.get("SOL").map(|d| d.price).unwrap_or(0.0);
+        let current_price = price_resp
+            .data
+            .get(SOL_MINT)
+            .and_then(|d| d.price.parse::<f64>().ok())
+            .unwrap_or(0.0);
 
         self.record_price(current_price);
         Ok(current_price)

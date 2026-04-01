@@ -61,21 +61,41 @@ struct SwapResponse {
     last_valid_block_height: Option<u64>,
 }
 
-/// Client for the Jupiter V6 Swap API.
+/// Client for the Jupiter Swap API (V1+).
 #[derive(Debug, Clone)]
 pub struct JupiterClient {
     base_url: String,
+    api_key: String,
     http: reqwest::Client,
 }
 
 impl JupiterClient {
-    pub fn new(base_url: &str) -> Self {
+    pub fn new(base_url: &str, api_key: &str) -> Self {
         Self {
             base_url: base_url.trim_end_matches('/').to_string(),
+            api_key: api_key.to_string(),
             http: reqwest::Client::builder()
                 .timeout(std::time::Duration::from_secs(15))
                 .build()
                 .expect("Failed to build HTTP client"),
+        }
+    }
+
+    fn build_request(&self, url: &str) -> reqwest::RequestBuilder {
+        let req = self.http.get(url);
+        if !self.api_key.is_empty() {
+            req.header("x-api-key", &self.api_key)
+        } else {
+            req
+        }
+    }
+
+    fn build_post_request(&self, url: &str) -> reqwest::RequestBuilder {
+        let req = self.http.post(url);
+        if !self.api_key.is_empty() {
+            req.header("x-api-key", &self.api_key)
+        } else {
+            req
         }
     }
 
@@ -101,8 +121,7 @@ impl JupiterClient {
         debug!(url = %url, "Requesting Jupiter quote");
 
         let response = self
-            .http
-            .get(&url)
+            .build_request(&url)
             .send()
             .await
             .context("Failed to request Jupiter quote")?;
@@ -158,8 +177,7 @@ impl JupiterClient {
         debug!("Requesting Jupiter swap transaction");
 
         let response = self
-            .http
-            .post(&url)
+            .build_post_request(&url)
             .json(&request_body)
             .send()
             .await

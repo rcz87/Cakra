@@ -25,6 +25,7 @@ pub struct Config {
 
     // Jupiter
     pub jupiter_api_url: String,
+    pub jupiter_api_key: String,
 
     // Security
     pub encryption_salt: String,
@@ -77,7 +78,8 @@ impl Config {
                 .unwrap_or_else(|_| "https://api.rugcheck.xyz/v1".to_string()),
 
             jupiter_api_url: env::var("JUPITER_API_URL")
-                .unwrap_or_else(|_| "https://quote-api.jup.ag/v6".to_string()),
+                .unwrap_or_else(|_| "https://api.jup.ag/swap/v1".to_string()),
+            jupiter_api_key: env::var("JUPITER_API_KEY").unwrap_or_default(),
 
             encryption_salt: env::var("ENCRYPTION_SALT")
                 .unwrap_or_else(|_| "default-salt-change-me".to_string()),

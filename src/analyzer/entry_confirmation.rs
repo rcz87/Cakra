@@ -1,5 +1,4 @@
 use anyhow::Result;
-use solana_client::rpc_client::RpcClient;
 use tracing::{info, warn};
 
 use crate::models::token::TokenInfo;

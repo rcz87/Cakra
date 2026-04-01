@@ -1,6 +1,6 @@
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
-use tracing::{info, warn};
+use tracing::info;
 
 /// Result from the GoPlus Security API.
 #[derive(Debug, Clone, Serialize, Deserialize)]

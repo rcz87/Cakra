@@ -45,7 +45,7 @@ pub fn build_sniper_message(
         vec![InlineKeyboardButton::callback(toggle_label, "snipe_toggle")],
         vec![
             InlineKeyboardButton::callback("\u{2699}\u{fe0f} Edit Settings", "settings"),
-            InlineKeyboardButton::callback("\u{2b05}\u{fe0f} Kembali", "menu"),
+            InlineKeyboardButton::callback("\u{2b05}\u{fe0f} Menu Utama", "menu"),
         ],
     ]);
 

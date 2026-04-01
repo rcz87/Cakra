@@ -51,38 +51,38 @@ pub fn build_settings_message(settings: &UserSettings) -> (String, InlineKeyboar
     );
 
     let kb = InlineKeyboardMarkup::new(vec![
-        // Row 1
+        // Row 1: Trading
         vec![
             InlineKeyboardButton::callback("\u{1f4b0} Slippage", "set:slippage"),
-            InlineKeyboardButton::callback("\u{1f4b5} Auto-Buy Amt", "set:auto_buy"),
+            InlineKeyboardButton::callback("\u{1f4b5} Buy Amount", "set:auto_buy"),
         ],
-        // Row 2
+        // Row 2: TP/SL
         vec![
             InlineKeyboardButton::callback("\u{2705} Take Profit", "set:tp"),
             InlineKeyboardButton::callback("\u{274c} Stop Loss", "set:sl"),
         ],
-        // Row 3
+        // Row 3: Advanced
         vec![
             InlineKeyboardButton::callback("\u{1f4c9} Trailing Stop", "set:trailing"),
             InlineKeyboardButton::callback("\u{1f6e1}\u{fe0f} Min Score", "set:min_score"),
         ],
-        // Row 4
+        // Row 4: Notif toggles
         vec![
             InlineKeyboardButton::callback(
-                format!("{} Notif Tokens", notif_tokens),
+                format!("{} Tokens", notif_tokens),
                 "set:notif_tokens",
             ),
             InlineKeyboardButton::callback(
-                format!("{} Notif Trades", notif_trades),
+                format!("{} Trades", notif_trades),
                 "set:notif_trades",
             ),
             InlineKeyboardButton::callback(
-                format!("{} Notif PnL", notif_pnl),
+                format!("{} PnL", notif_pnl),
                 "set:notif_pnl",
             ),
         ],
         // Row 5: back
-        vec![InlineKeyboardButton::callback("\u{2b05}\u{fe0f} Kembali", "menu")],
+        vec![InlineKeyboardButton::callback("\u{2b05}\u{fe0f} Menu Utama", "menu")],
     ]);
 
     (text, kb)

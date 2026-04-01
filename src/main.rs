@@ -13,6 +13,8 @@ mod wallet;
 use std::sync::Arc;
 
 use anyhow::Result;
+use teloxide::payloads::SendMessageSetters as _;
+use teloxide::prelude::Requester;
 use tokio::signal;
 use tokio::sync::{broadcast, mpsc};
 use tracing::{error, info, warn};
@@ -30,7 +32,6 @@ use crate::executor::positions::PositionManager;
 use crate::executor::price_feed::PriceFeed;
 use crate::executor::tp_sl::{process_tp_sl_commands, TpSlMonitor};
 use crate::executor::ExecutorService;
-use crate::models::token::TokenInfo;
 
 /// Shared application state available across all services.
 pub struct AppState {
@@ -64,7 +65,7 @@ async fn main() -> Result<()> {
     let lists = ListManager::new(db.clone());
     let cooldown = CooldownManager::new(config.trade_cooldown_secs);
 
-    let state = Arc::new(AppState {
+    let _state = Arc::new(AppState {
         config: config.clone(),
         db: db.clone(),
         risk,
@@ -135,6 +136,7 @@ async fn main() -> Result<()> {
     let analyzer_executor = executor.clone();
     let analyzer_wallet = wallet_manager.clone();
     let analyzer_password = wallet_password.clone();
+    let analyzer_positions = position_manager.clone();
     let mut analyzer_shutdown = shutdown_tx.subscribe();
     let analyzer_handle = tokio::spawn(async move {
         info!("Analyzer pipeline starting...");
@@ -142,6 +144,10 @@ async fn main() -> Result<()> {
         let rpc = solana_client::rpc_client::RpcClient::new(
             analyzer_config.effective_rpc_url().to_string(),
         );
+
+        // Telegram bot instance for sending notifications
+        let tg_bot = teloxide::Bot::new(&analyzer_config.telegram_bot_token);
+        let tg_chat = teloxide::types::ChatId(analyzer_config.telegram_admin_chat_id);
 
         loop {
             tokio::select! {
@@ -195,7 +201,7 @@ async fn main() -> Result<()> {
                                 info!(
                                     mint = %token.mint,
                                     score = score,
-                                    "Score >= {} → AUTO BUY",
+                                    "Score >= {} \u{2192} AUTO BUY",
                                     analyzer_config.min_score_auto_buy
                                 );
 
@@ -210,6 +216,16 @@ async fn main() -> Result<()> {
                                             reason = %reason,
                                             "Entry confirmation rejected, skipping buy"
                                         );
+                                        let _ = tg_bot.send_message(
+                                            tg_chat,
+                                            format!(
+                                                "\u{26a0}\u{fe0f} <b>Entry Rejected</b>\n\n\
+                                                 \u{1f4e6} {} (<code>{}</code>)\n\
+                                                 \u{1f6e1}\u{fe0f} Score: {}/100\n\
+                                                 \u{274c} Reason: {}",
+                                                token.symbol, token.mint, score, reason
+                                            ),
+                                        ).parse_mode(teloxide::types::ParseMode::Html).await;
                                         continue;
                                     }
                                     Err(e) => {
@@ -239,6 +255,40 @@ async fn main() -> Result<()> {
                                                             amount_sol = amount,
                                                             "AUTO BUY executed successfully"
                                                         );
+
+                                                        // Get position details for notification
+                                                        let pos = analyzer_positions.get_open_positions()
+                                                            .into_iter()
+                                                            .find(|p| p.token_mint == token.mint);
+
+                                                        let (entry_price, tokens_received) = match &pos {
+                                                            Some(p) => (p.entry_price_sol, p.token_amount),
+                                                            None => (0.0, 0.0),
+                                                        };
+
+                                                        let _ = tg_bot.send_message(
+                                                            tg_chat,
+                                                            format!(
+                                                                "\u{2705} <b>AUTO BUY Executed!</b>\n\
+                                                                 \u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\n\n\
+                                                                 \u{1f4e6} <b>Token:</b> {} (<code>{}</code>)\n\
+                                                                 \u{1f30d} <b>Source:</b> {}\n\
+                                                                 \u{1f6e1}\u{fe0f} <b>Score:</b> {}/100\n\
+                                                                 \u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\n\
+                                                                 \u{1f4b0} <b>Spent:</b> {} SOL\n\
+                                                                 \u{1f4b2} <b>Entry Price:</b> {:.10} SOL\n\
+                                                                 \u{1f4e6} <b>Received:</b> {:.2} tokens\n\
+                                                                 \u{1f4dd} <b>Tx:</b> <code>{}</code>\n\n\
+                                                                 <i>TP/SL aktif. Cek /positions</i>",
+                                                                token.symbol, token.mint,
+                                                                token.source,
+                                                                score,
+                                                                amount,
+                                                                entry_price,
+                                                                tokens_received,
+                                                                sig,
+                                                            ),
+                                                        ).parse_mode(teloxide::types::ParseMode::Html).await;
                                                     }
                                                     Err(e) => {
                                                         error!(
@@ -246,6 +296,22 @@ async fn main() -> Result<()> {
                                                             error = %e,
                                                             "AUTO BUY failed"
                                                         );
+
+                                                        let _ = tg_bot.send_message(
+                                                            tg_chat,
+                                                            format!(
+                                                                "\u{274c} <b>AUTO BUY Failed</b>\n\
+                                                                 \u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\n\n\
+                                                                 \u{1f4e6} <b>Token:</b> {} (<code>{}</code>)\n\
+                                                                 \u{1f6e1}\u{fe0f} <b>Score:</b> {}/100\n\
+                                                                 \u{1f4b0} <b>Amount:</b> {} SOL\n\
+                                                                 \u{26a0}\u{fe0f} <b>Error:</b> {}",
+                                                                token.symbol, token.mint,
+                                                                score,
+                                                                amount,
+                                                                e,
+                                                            ),
+                                                        ).parse_mode(teloxide::types::ParseMode::Html).await;
                                                     }
                                                 }
                                             }
@@ -255,7 +321,7 @@ async fn main() -> Result<()> {
                                         }
                                     }
                                     Ok(None) => {
-                                        warn!("No active wallet set — cannot auto-buy");
+                                        warn!("No active wallet set \u{2014} cannot auto-buy");
                                     }
                                     Err(e) => {
                                         error!(error = %e, "Failed to get active wallet");
@@ -265,16 +331,41 @@ async fn main() -> Result<()> {
                                 info!(
                                     mint = %token.mint,
                                     score = score,
-                                    "Score {}-{} → NOTIFY user",
+                                    "Score {}-{} \u{2192} NOTIFY user",
                                     analyzer_config.min_score_notify,
                                     analyzer_config.min_score_auto_buy
                                 );
-                                // TODO: Send Telegram notification to user
+
+                                // Send notification with buy buttons
+                                let lp_status = format!("{:?}", analysis.lp_status);
+                                let honeypot = format!("{:?}", analysis.honeypot_result);
+                                let _ = tg_bot.send_message(
+                                    tg_chat,
+                                    format!(
+                                        "\u{1f50d} <b>Token Detected</b>\n\
+                                         \u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\n\n\
+                                         \u{1f4e6} <b>{}</b> (<code>{}</code>)\n\
+                                         \u{1f30d} Source: {}\n\
+                                         \u{1f6e1}\u{fe0f} Score: <b>{}/100</b>\n\
+                                         \u{1f4b0} Liquidity: {:.2} SOL\n\
+                                         \u{1f512} LP: {}\n\
+                                         \u{1f41d} Honeypot: {}\n\n\
+                                         \u{1f4a1} <i>Score di bawah auto-buy ({}).\nGunakan /buy {} untuk beli manual.</i>",
+                                        token.symbol, token.mint,
+                                        token.source,
+                                        score,
+                                        token.initial_liquidity_sol,
+                                        lp_status,
+                                        honeypot,
+                                        analyzer_config.min_score_auto_buy,
+                                        token.mint,
+                                    ),
+                                ).parse_mode(teloxide::types::ParseMode::Html).await;
                             } else {
                                 info!(
                                     mint = %token.mint,
                                     score = score,
-                                    "Score < {} → SKIP",
+                                    "Score < {} \u{2192} SKIP",
                                     analyzer_config.min_score_notify
                                 );
                             }
@@ -395,8 +486,11 @@ async fn main() -> Result<()> {
     info!("Starting Telegram bot...");
     let bot_config = config.clone();
     let bot_db = db.clone();
+    let bot_wallet = wallet_manager.clone();
+    let bot_password = wallet_password.clone();
+    let bot_executor = executor.clone();
     let bot_handle = tokio::spawn(async move {
-        if let Err(e) = TelegramBot::start(bot_config, bot_db, bot_sell_tx).await {
+        if let Err(e) = TelegramBot::start(bot_config, bot_db, bot_sell_tx, bot_wallet, bot_password, bot_executor).await {
             error!(err = %e, "Telegram bot exited with error");
         }
     });

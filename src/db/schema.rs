@@ -67,7 +67,8 @@ pub fn create_tables(conn: &Connection) -> Result<()> {
             buy_tx TEXT NOT NULL,
             sell_tx TEXT,
             opened_at TEXT NOT NULL,
-            closed_at TEXT
+            closed_at TEXT,
+            security_score INTEGER NOT NULL DEFAULT 0
         );
 
         CREATE TABLE IF NOT EXISTS settings (

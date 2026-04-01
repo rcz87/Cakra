@@ -135,7 +135,7 @@ pub fn build_pumpfun_buy(
     let event_authority: Pubkey =
         PUMPFUN_EVENT_AUTHORITY.parse().context("Invalid event authority")?;
     let token_program: Pubkey = TOKEN_PROGRAM.parse()?;
-    let ata_program: Pubkey = ASSOCIATED_TOKEN_PROGRAM.parse()?;
+    let _ata_program: Pubkey = ASSOCIATED_TOKEN_PROGRAM.parse()?;
 
     // Derive PDAs
     let (bonding_curve, _) = derive_bonding_curve(mint)?;

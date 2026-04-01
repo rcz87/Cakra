@@ -1,0 +1,53 @@
+[package]
+name = "ricoz-sniper"
+version = "0.1.0"
+edition = "2021"
+description = "RICOZ SNIPER - Solana Auto-Trading Sniper Bot"
+
+[dependencies]
+# Solana 2.2.x
+solana-sdk = "2.2"
+solana-client = "2.2"
+solana-transaction-status = "2.2"
+spl-token = "6.0"
+
+# gRPC (Yellowstone) - v6 for solana 2.2
+yellowstone-grpc-client = { git = "https://github.com/rpcpool/yellowstone-grpc.git", tag = "v6.0.0+solana.2.2.12" }
+yellowstone-grpc-proto = { git = "https://github.com/rpcpool/yellowstone-grpc.git", tag = "v6.0.0+solana.2.2.12" }
+tonic = "0.12"
+
+# Telegram
+teloxide = { version = "0.13", features = ["macros"] }
+
+# Async Runtime
+tokio = { version = "1", features = ["full"] }
+futures = "0.3"
+
+# HTTP Client
+reqwest = { version = "0.12", features = ["json"] }
+
+# Database
+rusqlite = { version = "0.32", features = ["bundled"] }
+
+# Serialization
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+bincode = "1"
+
+# Crypto (key encryption)
+aes-gcm = "0.10"
+argon2 = "0.5"
+rand = "0.8"
+
+# Logging
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+# Utils
+base64 = "0.22"
+bs58 = "0.5"
+dotenvy = "0.15"
+chrono = { version = "0.4", features = ["serde"] }
+anyhow = "1"
+thiserror = "2"
+uuid = { version = "1", features = ["v4"] }

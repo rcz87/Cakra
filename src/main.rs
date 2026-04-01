@@ -331,6 +331,7 @@ async fn main() -> Result<()> {
     });
 
     // ── Spawn TP/SL Command Processor ──────────────────────────
+    let bot_sell_tx = sell_tx.clone();
     let tpsl_cmd_handle = tokio::spawn(async move {
         info!("TP/SL command processor starting...");
         process_tp_sl_commands(tpsl_command_rx, sell_tx).await;
@@ -390,7 +391,7 @@ async fn main() -> Result<()> {
     let bot_config = config.clone();
     let bot_db = db.clone();
     let bot_handle = tokio::spawn(async move {
-        if let Err(e) = TelegramBot::start(bot_config, bot_db).await {
+        if let Err(e) = TelegramBot::start(bot_config, bot_db, bot_sell_tx).await {
             error!(err = %e, "Telegram bot exited with error");
         }
     });

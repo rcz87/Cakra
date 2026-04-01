@@ -99,6 +99,7 @@ pub async fn get_token_price(
 
     let resp = http
         .get(&url)
+        .timeout(Duration::from_secs(5))
         .send()
         .await?
         .error_for_status()?

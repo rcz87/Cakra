@@ -138,14 +138,18 @@ pub async fn handle_callback(
         // Format: sell:<pct>:<mint>
         let parts: Vec<&str> = rest.splitn(2, ':').collect();
         if parts.len() == 2 {
-            let pct = parts[0];
-            let mint = parts[1];
-            bot.send_message(
-                chat_id,
-                format!("\u{1f4e4} Sell {}% of `{}`\n\u{23f3} Processing...", pct, mint),
-            )
-            .await?;
-            // TODO: execute sell via executor module
+            if let Ok(pct) = parts[0].parse::<u8>() {
+                let mint = parts[1].to_string();
+                bot.send_message(
+                    chat_id,
+                    format!("\u{1f4e4} Sell {}% of `{}`\n\u{23f3} Processing...", pct, &mint),
+                )
+                .await?;
+                if let Err(e) = state.sell_tx.send((mint, pct)).await {
+                    warn!("Failed to dispatch sell command: {}", e);
+                    bot.send_message(chat_id, "\u{274c} Failed to submit sell order.").await?;
+                }
+            }
         }
     } else if data == "positions" {
         handle_positions_cb(&bot, chat_id, &state).await?;
@@ -288,7 +292,7 @@ async fn handle_buy(
 async fn handle_sell(
     bot: Bot,
     msg: Message,
-    _state: Arc<BotState>,
+    state: Arc<BotState>,
     args: String,
 ) -> Result<(), teloxide::RequestError> {
     let parts: Vec<&str> = args.trim().split_whitespace().collect();
@@ -299,7 +303,15 @@ async fn handle_sell(
     }
 
     let mint = parts[0];
-    let pct = parts[1];
+    let pct_str = parts[1];
+
+    let pct: u8 = match pct_str.parse() {
+        Ok(v) if v >= 1 && v <= 100 => v,
+        _ => {
+            bot.send_message(msg.chat.id, "\u{274c} Percentage must be 1-100").await?;
+            return Ok(());
+        }
+    };
 
     bot.send_message(
         msg.chat.id,
@@ -311,7 +323,11 @@ async fn handle_sell(
     .parse_mode(ParseMode::Html)
     .await?;
 
-    // TODO: execute sell via executor module
+    if let Err(e) = state.sell_tx.send((mint.to_string(), pct)).await {
+        warn!("Failed to dispatch sell command: {}", e);
+        bot.send_message(msg.chat.id, "\u{274c} Failed to submit sell order.").await?;
+    }
+
     Ok(())
 }
 

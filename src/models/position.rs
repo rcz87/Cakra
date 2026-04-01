@@ -45,6 +45,7 @@ impl Position {
         if self.entry_price_sol > 0.0 {
             self.pnl_pct = ((current_price / self.entry_price_sol) - 1.0) * 100.0;
         }
+        self.update_age();
     }
 
     pub fn update_age(&mut self) {

@@ -7,32 +7,27 @@ pub mod pumpfun_buy;
 pub mod raydium;
 pub mod retry;
 pub mod router;
-pub mod sell;
 pub mod tp_sl;
 
 use std::sync::Arc;
 
 use anyhow::{Context, Result};
 use solana_client::rpc_client::RpcClient;
+use solana_sdk::pubkey::Pubkey;
 use solana_sdk::signer::keypair::Keypair;
 use solana_sdk::signer::Signer;
 use solana_sdk::transaction::Transaction;
-use tracing::{error, info, warn};
+use tracing::info;
 
 use crate::config::Config;
 use crate::db::DbPool;
-use crate::models::token::{TokenInfo, TokenSource};
+use crate::models::token::TokenInfo;
 use crate::risk::{RiskManager, CooldownManager, ListManager, RiskCheck};
 
 use self::jito::JitoClient;
-use self::jupiter::JupiterClient;
+use self::jupiter::{JupiterClient, to_solana_instruction};
 use self::positions::PositionManager;
-use self::priority::calculate_priority_fee;
-use self::pumpfun_buy::build_pumpfun_buy;
-use self::raydium::build_raydium_swap;
 use self::retry::retry_with_backoff;
-use self::router::{find_best_route, Route, RouteType};
-use self::sell::build_sell_instruction;
 
 /// Central executor service that coordinates all trading operations
 /// for the RICOZ SNIPER bot.
@@ -58,7 +53,7 @@ impl ExecutorService {
     ) -> Self {
         let rpc = Arc::new(RpcClient::new(config.effective_rpc_url().to_string()));
         let jito = JitoClient::new(&config.jito_block_engine_url);
-        let jupiter = JupiterClient::new(&config.jupiter_api_url);
+        let jupiter = JupiterClient::new(&config.jupiter_api_url, &config.jupiter_api_key);
         let positions = PositionManager::new(db.clone());
 
         Self {
@@ -128,69 +123,111 @@ impl ExecutorService {
         }
 
         let amount_lamports = (amount_sol * 1_000_000_000.0) as u64;
+        let wsol_mint = "So11111111111111111111111111111111111111112";
+        let taker = wallet.pubkey().to_string();
 
-        // Find the best route across all DEXes
-        let route = retry_with_backoff(
+        // 1. Get a quote from Jupiter Swap API
+        let quote = retry_with_backoff(
             || {
-                let token = token.clone();
                 let jupiter = self.jupiter.clone();
-                let rpc = self.rpc.clone();
-                let config = self.config.clone();
+                let mint = token.mint.clone();
                 async move {
-                    find_best_route(&token, amount_lamports, slippage_bps, &jupiter, &rpc, &config)
+                    jupiter
+                        .get_quote(wsol_mint, &mint, amount_lamports, slippage_bps)
                         .await
                 }
             },
             3,
         )
         .await
-        .context("Failed to find route")?;
+        .context("Failed to get Jupiter quote")?;
 
+        let expected_output: u64 = quote
+            .out_amount
+            .parse()
+            .context("Failed to parse Jupiter out_amount")?;
         info!(
-            route = ?route.route_type,
-            expected_output = route.expected_output,
-            "Best route found"
+            expected_output = expected_output,
+            slippage_bps = slippage_bps,
+            price_impact = %quote.price_impact_pct,
+            "Jupiter quote received for buy"
         );
 
-        // Build the transaction based on the chosen route
-        let tx = self
-            .build_transaction_for_route(&route, token, amount_lamports, slippage_bps, wallet)
+        // 2. Get swap instructions from Jupiter
+        let swap_ixs = self
+            .jupiter
+            .get_swap_instructions(&quote, &taker)
             .await
-            .context("Failed to build transaction")?;
+            .context("Failed to get Jupiter swap instructions")?;
 
-        // Calculate dynamic priority fee
-        let priority_fee = calculate_priority_fee(&self.rpc, 1.5).await.unwrap_or_else(|e| {
-            warn!("Failed to calculate priority fee, using default: {e}");
-            5000
-        });
-
-        info!(priority_fee = priority_fee, "Using priority fee");
-
-        // Submit via Jito bundle for MEV protection
-        let tip_lamports = self.config.jito_tip_lamports.max(priority_fee);
-        let signature = retry_with_backoff(
-            || {
-                let jito = self.jito.clone();
-                let tx = tx.clone();
-                let tip = tip_lamports;
-                async move { jito.submit_bundle(vec![tx], tip).await }
-            },
-            3,
-        )
-        .await
-        .context("Failed to submit Jito bundle")?;
-
-        info!(signature = %signature, "Buy transaction submitted");
-
-        // Confirm the bundle landed on-chain before creating a position
-        let confirmed = self.jito.confirm_bundle(&signature, 30).await?;
-        if !confirmed {
-            anyhow::bail!("Transaction not confirmed");
+        // 3. Build transaction from instructions
+        let mut instructions = Vec::new();
+        for ix in &swap_ixs.compute_budget_instructions {
+            instructions.push(to_solana_instruction(ix)?);
+        }
+        for ix in &swap_ixs.setup_instructions {
+            instructions.push(to_solana_instruction(ix)?);
+        }
+        instructions.push(to_solana_instruction(&swap_ixs.swap_instruction)?);
+        if let Some(cleanup) = &swap_ixs.cleanup_instruction {
+            instructions.push(to_solana_instruction(cleanup)?);
+        }
+        if let Some(other) = &swap_ixs.other_instructions {
+            for ix in other {
+                instructions.push(to_solana_instruction(ix)?);
+            }
         }
 
-        // Track the new position
-        let entry_price = if route.expected_output > 0 {
-            amount_sol / (route.expected_output as f64)
+        let recent_blockhash = self
+            .rpc
+            .get_latest_blockhash()
+            .context("Failed to get recent blockhash")?;
+
+        let swap_tx = Transaction::new_signed_with_payer(
+            &instructions,
+            Some(&wallet.pubkey()),
+            &[wallet],
+            recent_blockhash,
+        );
+
+        // 4. Submit via Jito bundle for MEV protection
+        let bundle_id = self
+            .jito
+            .submit_bundle(
+                vec![swap_tx],
+                self.config.jito_tip_lamports,
+                wallet,
+                recent_blockhash,
+            )
+            .await
+            .context("Failed to submit buy bundle to Jito")?;
+
+        // 5. Confirm the bundle landed
+        let confirmation = self
+            .jito
+            .confirm_bundle(&bundle_id, 60)
+            .await
+            .context("Failed to confirm buy bundle")?;
+
+        if !confirmation.is_landed() {
+            anyhow::bail!(
+                "Buy bundle did not land for mint {} (bundle_id: {})",
+                token.mint,
+                bundle_id
+            );
+        }
+
+        let signature = bundle_id.clone();
+
+        info!(
+            bundle_id = %bundle_id,
+            expected_output = expected_output,
+            "Buy confirmed via Jito bundle"
+        );
+
+        // Track the position using expected output from quote
+        let entry_price = if expected_output > 0 {
+            amount_sol / (expected_output as f64)
         } else {
             0.0
         };
@@ -198,18 +235,17 @@ impl ExecutorService {
         self.positions.open_position(
             &token.mint,
             &token.symbol,
-            &wallet.pubkey().to_string(),
+            &taker,
             entry_price,
             amount_sol,
-            route.expected_output as f64,
+            expected_output as f64,
             self.config.default_slippage_bps,
             &signature,
+            0, // security_score: caller can override when available
         )?;
 
         // Record trade for cooldown tracking
-        self.cooldown.record_trade(&wallet.pubkey().to_string());
-
-        // TODO: validate_slippage post-transaction by comparing expected vs actual output on-chain
+        self.cooldown.record_trade(&taker);
 
         Ok(signature)
     }
@@ -232,104 +268,148 @@ impl ExecutorService {
             anyhow::bail!("Invalid sell percentage: {amount_pct}. Must be 1-100");
         }
 
-        // Build sell instructions (handles token account lookup and amount calc)
-        let instructions =
-            build_sell_instruction(mint, amount_pct, &wallet.pubkey(), &self.rpc, &self.jupiter)
-                .await
-                .context("Failed to build sell instruction")?;
+        let wsol_mint = "So11111111111111111111111111111111111111112";
+        let taker = wallet.pubkey().to_string();
 
-        if instructions.is_empty() {
-            anyhow::bail!("No sell instructions generated - token balance may be zero");
+        // Get token balance to calculate sell amount
+        let mint_pubkey: Pubkey = mint.parse().context("Invalid mint address")?;
+        let token_program: Pubkey = "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA"
+            .parse()
+            .unwrap();
+        let ata_program: Pubkey = "ATokenGPvbdGVxr1b2hvZbsiqW5xWH25efTNsLJA8knL"
+            .parse()
+            .unwrap();
+        let (ata, _) = Pubkey::find_program_address(
+            &[
+                wallet.pubkey().as_ref(),
+                token_program.as_ref(),
+                mint_pubkey.as_ref(),
+            ],
+            &ata_program,
+        );
+
+        let balance = self
+            .rpc
+            .get_token_account_balance(&ata)
+            .context("Failed to get token balance for sell")?;
+        let total_amount: u64 = balance
+            .amount
+            .parse()
+            .context("Failed to parse token balance")?;
+
+        if total_amount == 0 {
+            anyhow::bail!("Token balance is zero for mint {mint}");
         }
 
-        let recent_blockhash = self.rpc.get_latest_blockhash()?;
-        let tx = Transaction::new_signed_with_payer(
+        let sell_amount = (total_amount as u128 * amount_pct as u128 / 100) as u64;
+        if sell_amount == 0 {
+            anyhow::bail!("Calculated sell amount is zero");
+        }
+
+        info!(
+            total_balance = total_amount,
+            sell_pct = amount_pct,
+            sell_amount = sell_amount,
+            "Selling via Jupiter Swap API"
+        );
+
+        // 1. Get a quote: token → SOL
+        let default_slippage = self.config.default_slippage_bps;
+        let quote = retry_with_backoff(
+            || {
+                let jupiter = self.jupiter.clone();
+                let mint = mint.to_string();
+                async move {
+                    jupiter
+                        .get_quote(&mint, wsol_mint, sell_amount, default_slippage)
+                        .await
+                }
+            },
+            3,
+        )
+        .await
+        .context("Failed to get Jupiter sell quote")?;
+
+        // 2. Get swap instructions
+        let swap_ixs = self
+            .jupiter
+            .get_swap_instructions(&quote, &taker)
+            .await
+            .context("Failed to get Jupiter swap instructions for sell")?;
+
+        // 3. Build transaction from instructions
+        let mut instructions = Vec::new();
+        for ix in &swap_ixs.compute_budget_instructions {
+            instructions.push(to_solana_instruction(ix)?);
+        }
+        for ix in &swap_ixs.setup_instructions {
+            instructions.push(to_solana_instruction(ix)?);
+        }
+        instructions.push(to_solana_instruction(&swap_ixs.swap_instruction)?);
+        if let Some(cleanup) = &swap_ixs.cleanup_instruction {
+            instructions.push(to_solana_instruction(cleanup)?);
+        }
+        if let Some(other) = &swap_ixs.other_instructions {
+            for ix in other {
+                instructions.push(to_solana_instruction(ix)?);
+            }
+        }
+
+        let recent_blockhash = self
+            .rpc
+            .get_latest_blockhash()
+            .context("Failed to get recent blockhash for sell")?;
+
+        let swap_tx = Transaction::new_signed_with_payer(
             &instructions,
             Some(&wallet.pubkey()),
             &[wallet],
             recent_blockhash,
         );
 
-        let tip_lamports = self.config.jito_tip_lamports;
-        let signature = retry_with_backoff(
-            || {
-                let jito = self.jito.clone();
-                let tx = tx.clone();
-                let tip = tip_lamports;
-                async move { jito.submit_bundle(vec![tx], tip).await }
-            },
-            3,
-        )
-        .await
-        .context("Failed to submit sell bundle")?;
+        // 4. Submit via Jito bundle
+        let bundle_id = self
+            .jito
+            .submit_bundle(
+                vec![swap_tx],
+                self.config.jito_tip_lamports,
+                wallet,
+                recent_blockhash,
+            )
+            .await
+            .context("Failed to submit sell bundle to Jito")?;
 
-        info!(signature = %signature, "Sell transaction submitted");
+        // 5. Confirm the bundle landed
+        let confirmation = self
+            .jito
+            .confirm_bundle(&bundle_id, 60)
+            .await
+            .context("Failed to confirm sell bundle")?;
 
-        // Close position if 100% sell
-        if amount_pct == 100 {
+        if !confirmation.is_landed() {
+            anyhow::bail!(
+                "Sell bundle did not land for mint {} (bundle_id: {})",
+                mint,
+                bundle_id
+            );
+        }
+
+        let signature = bundle_id.clone();
+
+        info!(
+            bundle_id = %bundle_id,
+            expected_sol = %quote.out_amount,
+            "Sell confirmed via Jito bundle"
+        );
+
+        // Update position tracking
+        if amount_pct >= 100 {
             self.positions.close_position(mint, &signature)?;
+        } else {
+            self.positions.reduce_position(mint, amount_pct, &signature)?;
         }
 
         Ok(signature)
     }
 
-    async fn build_transaction_for_route(
-        &self,
-        route: &Route,
-        token: &TokenInfo,
-        amount_lamports: u64,
-        slippage_bps: u16,
-        wallet: &Keypair,
-    ) -> Result<Transaction> {
-        let mint: solana_sdk::pubkey::Pubkey = token.mint.parse()?;
-
-        match route.route_type {
-            RouteType::PumpFun => {
-                let ix =
-                    build_pumpfun_buy(&mint, amount_lamports, slippage_bps, &wallet.pubkey())?;
-                let recent_blockhash = self.rpc.get_latest_blockhash()?;
-                Ok(Transaction::new_signed_with_payer(
-                    &[ix],
-                    Some(&wallet.pubkey()),
-                    &[wallet],
-                    recent_blockhash,
-                ))
-            }
-            RouteType::Jupiter => {
-                let wsol_mint = "So11111111111111111111111111111111111111112";
-                let quote = self
-                    .jupiter
-                    .get_quote(wsol_mint, &token.mint, amount_lamports, slippage_bps)
-                    .await?;
-                let tx = self
-                    .jupiter
-                    .build_swap_tx(&quote, &wallet.pubkey().to_string())
-                    .await?;
-                Ok(tx)
-            }
-            RouteType::Raydium => {
-                let pool_address = token
-                    .pool_address
-                    .as_ref()
-                    .context("No pool address for Raydium route")?;
-                let wsol_mint: solana_sdk::pubkey::Pubkey =
-                    "So11111111111111111111111111111111111111112".parse()?;
-                let ix = build_raydium_swap(
-                    pool_address,
-                    &wsol_mint,
-                    &mint,
-                    amount_lamports,
-                    route.min_output,
-                    &wallet.pubkey(),
-                )?;
-                let recent_blockhash = self.rpc.get_latest_blockhash()?;
-                Ok(Transaction::new_signed_with_payer(
-                    &[ix],
-                    Some(&wallet.pubkey()),
-                    &[wallet],
-                    recent_blockhash,
-                ))
-            }
-        }
-    }
 }

@@ -1,10 +1,15 @@
 use anyhow::{Context, Result};
 use base64::{engine::general_purpose::STANDARD as BASE64, Engine};
 use serde::{Deserialize, Serialize};
-use solana_sdk::transaction::Transaction;
+use solana_sdk::instruction::{AccountMeta, Instruction};
+use solana_sdk::pubkey::Pubkey;
 use tracing::{debug, error, info};
 
-/// Response from Jupiter V6 quote endpoint.
+use std::str::FromStr;
+
+// ── Swap API types (used by PriceFeed + quote-only flows) ───────────
+
+/// Response from Jupiter Swap API /quote endpoint.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct QuoteResponse {
@@ -41,37 +46,98 @@ pub struct SwapInfo {
     pub fee_mint: String,
 }
 
-/// Request body for Jupiter V6 swap endpoint.
+// ── Swap Instructions API types ────────────────────────────────────
+
+/// A single instruction from Jupiter's /swap-instructions response.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct JupiterInstruction {
+    pub program_id: String,
+    pub accounts: Vec<JupiterAccountMeta>,
+    pub data: String, // base64 encoded
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct JupiterAccountMeta {
+    pub pubkey: String,
+    pub is_signer: bool,
+    pub is_writable: bool,
+}
+
+/// Response from POST /swap-instructions.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SwapInstructionsResponse {
+    pub compute_budget_instructions: Vec<JupiterInstruction>,
+    pub setup_instructions: Vec<JupiterInstruction>,
+    pub swap_instruction: JupiterInstruction,
+    pub cleanup_instruction: Option<JupiterInstruction>,
+    pub other_instructions: Option<Vec<JupiterInstruction>>,
+    pub address_lookup_table_addresses: Vec<String>,
+}
+
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
-struct SwapRequest {
+struct SwapInstructionsRequest {
     quote_response: QuoteResponse,
     user_public_key: String,
     wrap_and_unwrap_sol: bool,
-    use_shared_accounts: bool,
     dynamic_compute_unit_limit: bool,
-    prioritization_fee_lamports: String,
+    prioritization_fee_lamports: serde_json::Value, // "auto" or number
 }
 
-/// Response from Jupiter V6 swap endpoint.
-#[derive(Debug, Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct SwapResponse {
-    swap_transaction: String,
-    last_valid_block_height: Option<u64>,
+// ── Instruction conversion ─────────────────────────────────────────
+
+/// Convert a Jupiter API instruction into a `solana_sdk::instruction::Instruction`.
+pub fn to_solana_instruction(jup_ix: &JupiterInstruction) -> Result<Instruction> {
+    let program_id =
+        Pubkey::from_str(&jup_ix.program_id).context("Invalid program_id pubkey")?;
+
+    let accounts = jup_ix
+        .accounts
+        .iter()
+        .map(|a| {
+            let pubkey = Pubkey::from_str(&a.pubkey)
+                .with_context(|| format!("Invalid account pubkey: {}", a.pubkey))?;
+            Ok(if a.is_writable {
+                AccountMeta::new(pubkey, a.is_signer)
+            } else {
+                AccountMeta::new_readonly(pubkey, a.is_signer)
+            })
+        })
+        .collect::<Result<Vec<_>>>()?;
+
+    let data = BASE64
+        .decode(&jup_ix.data)
+        .context("Failed to decode instruction data from base64")?;
+
+    Ok(Instruction {
+        program_id,
+        accounts,
+        data,
+    })
 }
 
-/// Client for the Jupiter V6 Swap API.
+// ── Client ──────────────────────────────────────────────────────────
+
+/// Client for Jupiter Swap API.
+///
+/// Primary flow: GET /quote → POST /swap-instructions → build & send transaction locally.
+/// Also used by PriceFeed for price-only queries via GET /quote.
 #[derive(Debug, Clone)]
 pub struct JupiterClient {
-    base_url: String,
+    /// Base URL for Swap API (quote/swap endpoints).
+    swap_base_url: String,
+    api_key: String,
     http: reqwest::Client,
 }
 
 impl JupiterClient {
-    pub fn new(base_url: &str) -> Self {
+    pub fn new(swap_base_url: &str, api_key: &str) -> Self {
         Self {
-            base_url: base_url.trim_end_matches('/').to_string(),
+            swap_base_url: swap_base_url.trim_end_matches('/').to_string(),
+            api_key: api_key.to_string(),
             http: reqwest::Client::builder()
                 .timeout(std::time::Duration::from_secs(15))
                 .build()
@@ -79,13 +145,69 @@ impl JupiterClient {
         }
     }
 
-    /// Get a swap quote from Jupiter.
-    ///
-    /// # Arguments
-    /// * `input_mint` - Input token mint address (e.g. SOL wrapped mint)
-    /// * `output_mint` - Output token mint address
-    /// * `amount` - Amount of input token in smallest unit (lamports for SOL)
-    /// * `slippage_bps` - Slippage tolerance in basis points
+    fn add_auth(&self, req: reqwest::RequestBuilder) -> reqwest::RequestBuilder {
+        if !self.api_key.is_empty() {
+            req.header("x-api-key", &self.api_key)
+        } else {
+            req
+        }
+    }
+
+    // ── Swap Instructions API ───────────────────────────────────
+
+    /// Request swap instructions from Jupiter for a given quote.
+    /// Returns raw instructions that the caller can assemble into a transaction.
+    pub async fn get_swap_instructions(
+        &self,
+        quote: &QuoteResponse,
+        user_pubkey: &str,
+    ) -> Result<SwapInstructionsResponse> {
+        let url = format!("{}/swap-instructions", self.swap_base_url);
+
+        let body = SwapInstructionsRequest {
+            quote_response: quote.clone(),
+            user_public_key: user_pubkey.to_string(),
+            wrap_and_unwrap_sol: true,
+            dynamic_compute_unit_limit: true,
+            prioritization_fee_lamports: serde_json::json!("auto"),
+        };
+
+        debug!(url = %url, user_pubkey = %user_pubkey, "Requesting Jupiter swap instructions");
+
+        let response = self
+            .add_auth(self.http.post(&url))
+            .json(&body)
+            .send()
+            .await
+            .context("Failed to request Jupiter swap instructions")?;
+
+        let status = response.status();
+        if !status.is_success() {
+            let resp_body = response.text().await.unwrap_or_default();
+            error!(status = %status, body = %resp_body, "Jupiter swap-instructions request failed");
+            anyhow::bail!("Jupiter swap-instructions failed with HTTP {status}: {resp_body}");
+        }
+
+        let instructions: SwapInstructionsResponse = response
+            .json()
+            .await
+            .context("Failed to parse Jupiter swap-instructions response")?;
+
+        info!(
+            num_compute_budget = instructions.compute_budget_instructions.len(),
+            num_setup = instructions.setup_instructions.len(),
+            has_cleanup = instructions.cleanup_instruction.is_some(),
+            num_alts = instructions.address_lookup_table_addresses.len(),
+            "Jupiter swap instructions received"
+        );
+
+        Ok(instructions)
+    }
+
+    // ── Swap API (quote-only, for PriceFeed) ────────────────────
+
+    /// Get a swap quote from Jupiter Swap API.
+    /// Used primarily by PriceFeed for price polling.
     pub async fn get_quote(
         &self,
         input_mint: &str,
@@ -94,15 +216,14 @@ impl JupiterClient {
         slippage_bps: u16,
     ) -> Result<QuoteResponse> {
         let url = format!(
-            "{}/quote?inputMint={}&outputMint={}&amount={}&slippageBps={}&onlyDirectRoutes=false&asLegacyTransaction=false",
-            self.base_url, input_mint, output_mint, amount, slippage_bps
+            "{}/quote?inputMint={}&outputMint={}&amount={}&slippageBps={}",
+            self.swap_base_url, input_mint, output_mint, amount, slippage_bps
         );
 
         debug!(url = %url, "Requesting Jupiter quote");
 
         let response = self
-            .http
-            .get(&url)
+            .add_auth(self.http.get(&url))
             .send()
             .await
             .context("Failed to request Jupiter quote")?;
@@ -131,71 +252,7 @@ impl JupiterClient {
         Ok(quote)
     }
 
-    /// Build a swap transaction from a quote response.
-    ///
-    /// # Arguments
-    /// * `quote` - The quote response from `get_quote`
-    /// * `user_pubkey` - The user's wallet public key as a string
-    ///
-    /// # Returns
-    /// A deserialized `Transaction` ready for signing and sending.
-    pub async fn build_swap_tx(
-        &self,
-        quote: &QuoteResponse,
-        user_pubkey: &str,
-    ) -> Result<Transaction> {
-        let url = format!("{}/swap", self.base_url);
-
-        let request_body = SwapRequest {
-            quote_response: quote.clone(),
-            user_public_key: user_pubkey.to_string(),
-            wrap_and_unwrap_sol: true,
-            use_shared_accounts: true,
-            dynamic_compute_unit_limit: true,
-            prioritization_fee_lamports: "auto".to_string(),
-        };
-
-        debug!("Requesting Jupiter swap transaction");
-
-        let response = self
-            .http
-            .post(&url)
-            .json(&request_body)
-            .send()
-            .await
-            .context("Failed to request Jupiter swap transaction")?;
-
-        let status = response.status();
-        if !status.is_success() {
-            let body = response.text().await.unwrap_or_default();
-            error!(status = %status, body = %body, "Jupiter swap request failed");
-            anyhow::bail!("Jupiter swap failed with HTTP {status}: {body}");
-        }
-
-        let swap_response: SwapResponse = response
-            .json()
-            .await
-            .context("Failed to parse Jupiter swap response")?;
-
-        // Decode the base64 transaction
-        let tx_bytes = BASE64
-            .decode(&swap_response.swap_transaction)
-            .context("Failed to decode Jupiter swap transaction from base64")?;
-
-        let tx: Transaction =
-            bincode::deserialize(&tx_bytes).context("Failed to deserialize swap transaction")?;
-
-        info!(
-            user = %user_pubkey,
-            block_height = ?swap_response.last_valid_block_height,
-            "Jupiter swap transaction built"
-        );
-
-        Ok(tx)
-    }
-
     /// Get the expected output amount for a given input.
-    /// Convenience wrapper around `get_quote` that returns just the output amount.
     pub async fn get_expected_output(
         &self,
         input_mint: &str,

@@ -3,12 +3,16 @@ use base64::{engine::general_purpose::STANDARD as BASE64, Engine};
 use rand::Rng;
 use serde::{Deserialize, Serialize};
 use solana_sdk::{
-    instruction::{AccountMeta, Instruction},
+    hash::Hash,
     pubkey::Pubkey,
+    signer::keypair::Keypair,
+    signer::Signer,
     system_instruction,
     transaction::Transaction,
 };
-use tracing::{error, info, warn};
+use tracing::{debug, error, info, warn};
+
+// ── Bundle status types ─────────────────────────────────────────────
 
 #[derive(Debug, Deserialize)]
 struct BundleStatusResponse {
@@ -27,7 +31,25 @@ struct BundleStatusEntry {
     landed_slot: Option<u64>,
 }
 
-/// Known Jito tip payment accounts.
+/// Result of a bundle confirmation poll.
+#[derive(Debug, Clone)]
+pub enum BundleConfirmation {
+    /// Bundle landed on-chain at the given slot.
+    Landed { slot: Option<u64> },
+    /// Bundle was explicitly rejected by the block engine.
+    Failed { status: String },
+    /// Polling timed out without a terminal status.
+    Timeout,
+}
+
+impl BundleConfirmation {
+    pub fn is_landed(&self) -> bool {
+        matches!(self, Self::Landed { .. })
+    }
+}
+
+// ── Known Jito tip accounts ─────────────────────────────────────────
+
 const JITO_TIP_ACCOUNTS: &[&str] = &[
     "96gYZGLnJYVFmbjzopPSU6QiEV5fGqZNyN9nmNhvrZU5",
     "HFqU5x63VTqvQss8hp11i4bVqkfRtQ3NpsLTUBFFL2Lg",
@@ -39,12 +61,14 @@ const JITO_TIP_ACCOUNTS: &[&str] = &[
     "3AVi9Tg9Uo68tJfuvoKvqKNWKkC5wPdSSdeBnizKZ6jT",
 ];
 
+// ── JSON-RPC types ──────────────────────────────────────────────────
+
 #[derive(Debug, Clone, Serialize)]
-struct JitoBundleRequest {
+struct JitoRpcRequest {
     jsonrpc: String,
     id: u64,
     method: String,
-    params: Vec<Vec<String>>,
+    params: Vec<serde_json::Value>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -59,6 +83,8 @@ struct JitoError {
     code: Option<i64>,
 }
 
+// ── Client ──────────────────────────────────────────────────────────
+
 /// Client for submitting transaction bundles to the Jito block engine
 /// for MEV protection and priority landing.
 #[derive(Debug, Clone)]
@@ -71,43 +97,93 @@ impl JitoClient {
     pub fn new(endpoint: &str) -> Self {
         Self {
             endpoint: format!("{}/api/v1/bundles", endpoint.trim_end_matches('/')),
-            http: reqwest::Client::new(),
+            http: reqwest::Client::builder()
+                .timeout(std::time::Duration::from_secs(15))
+                .build()
+                .expect("Failed to build Jito HTTP client"),
         }
     }
 
-    /// Build a tip transaction that pays a random Jito tip account.
-    pub fn build_tip_instruction(payer: &Pubkey, tip_lamports: u64) -> Result<Instruction> {
-        let mut rng = rand::thread_rng();
-        let tip_index = rng.gen_range(0..JITO_TIP_ACCOUNTS.len());
-        let tip_account: Pubkey = JITO_TIP_ACCOUNTS[tip_index]
-            .parse()
-            .context("Failed to parse Jito tip account")?;
-
-        Ok(system_instruction::transfer(payer, &tip_account, tip_lamports))
+    /// Pick a random Jito tip account and build a SOL transfer instruction to it.
+    pub fn build_tip_instruction(payer: &Pubkey, tip_lamports: u64) -> Result<()> {
+        // Kept for backward compat — use build_tip_tx() instead.
+        let _ = Self::random_tip_account()?;
+        Ok(())
     }
 
-    /// Submit a bundle of transactions to the Jito block engine.
-    /// A tip transaction is automatically appended to the last transaction
-    /// if not already present.
+    /// Build a standalone tip transaction that transfers SOL to a random Jito tip account.
+    /// This is appended as the last transaction in the bundle.
+    pub fn build_tip_tx(
+        payer: &Keypair,
+        tip_lamports: u64,
+        recent_blockhash: Hash,
+    ) -> Result<Transaction> {
+        if tip_lamports == 0 {
+            anyhow::bail!("Tip must be > 0 lamports");
+        }
+
+        let tip_account = Self::random_tip_account()?;
+        let ix = system_instruction::transfer(&payer.pubkey(), &tip_account, tip_lamports);
+
+        let tx = Transaction::new_signed_with_payer(
+            &[ix],
+            Some(&payer.pubkey()),
+            &[payer],
+            recent_blockhash,
+        );
+
+        Ok(tx)
+    }
+
+    /// Submit a bundle WITH a tip transaction automatically appended.
     ///
-    /// Returns the bundle ID on success.
+    /// The tip is built as a separate signed transaction appended to the end of the bundle.
+    /// Jito requires the tip to be in the LAST transaction of the bundle.
+    ///
+    /// # Arguments
+    /// * `transactions` - Pre-signed swap/trade transactions
+    /// * `tip_lamports` - SOL tip to Jito (in lamports). Must be > 0.
+    /// * `payer` - Keypair that pays the tip
+    /// * `recent_blockhash` - Recent blockhash for the tip transaction
     pub async fn submit_bundle(
         &self,
         transactions: Vec<Transaction>,
         tip_lamports: u64,
+        payer: &Keypair,
+        recent_blockhash: Hash,
     ) -> Result<String> {
         if transactions.is_empty() {
             anyhow::bail!("Cannot submit empty bundle");
         }
 
+        if tip_lamports == 0 {
+            anyhow::bail!("Jito tip must be > 0 lamports");
+        }
+
+        // Validate that all transactions have at least one signature
+        for (i, tx) in transactions.iter().enumerate() {
+            if tx.signatures.is_empty() || tx.signatures[0] == solana_sdk::signature::Signature::default() {
+                anyhow::bail!("Transaction {} in bundle is unsigned", i);
+            }
+        }
+
+        // Build and append the tip transaction as the last entry
+        let tip_tx = Self::build_tip_tx(payer, tip_lamports, recent_blockhash)?;
+
+        let mut bundle = transactions;
+        bundle.push(tip_tx);
+
+        let bundle_size = bundle.len();
+
         info!(
-            tx_count = transactions.len(),
+            tx_count = bundle_size,
             tip_lamports = tip_lamports,
-            "Submitting Jito bundle"
+            payer = %payer.pubkey(),
+            "Submitting Jito bundle (last tx = tip)"
         );
 
-        // Serialize all transactions to base64
-        let encoded_txs: Vec<String> = transactions
+        // Serialize all transactions to base64 (Jito expects base64 for sendBundle)
+        let encoded_txs: Vec<String> = bundle
             .iter()
             .map(|tx| {
                 let serialized =
@@ -116,11 +192,11 @@ impl JitoClient {
             })
             .collect::<Result<Vec<_>>>()?;
 
-        let request = JitoBundleRequest {
+        let request = JitoRpcRequest {
             jsonrpc: "2.0".to_string(),
             id: 1,
             method: "sendBundle".to_string(),
-            params: vec![encoded_txs],
+            params: vec![serde_json::json!(encoded_txs)],
         };
 
         let response = self
@@ -156,26 +232,110 @@ impl JitoClient {
             .result
             .context("Jito response missing bundle ID")?;
 
-        info!(bundle_id = %bundle_id, "Jito bundle submitted successfully");
+        info!(
+            bundle_id = %bundle_id,
+            tx_count = bundle_size,
+            tip_lamports = tip_lamports,
+            "Jito bundle submitted successfully"
+        );
 
         Ok(bundle_id)
     }
 
-    /// Check the status of a previously submitted bundle.
-    pub async fn get_bundle_status(&self, bundle_id: &str) -> Result<String> {
-        #[derive(Serialize)]
-        struct StatusRequest {
-            jsonrpc: String,
-            id: u64,
-            method: String,
-            params: Vec<Vec<String>>,
-        }
+    /// Poll for bundle confirmation.
+    ///
+    /// Returns a structured `BundleConfirmation` indicating whether the bundle
+    /// landed, failed, or timed out.
+    pub async fn confirm_bundle(
+        &self,
+        bundle_id: &str,
+        timeout_secs: u64,
+    ) -> Result<BundleConfirmation> {
+        let deadline =
+            tokio::time::Instant::now() + std::time::Duration::from_secs(timeout_secs);
+        let poll_interval = std::time::Duration::from_millis(1500);
+        let mut attempts = 0u32;
 
-        let request = StatusRequest {
+        loop {
+            if tokio::time::Instant::now() >= deadline {
+                warn!(
+                    bundle_id = %bundle_id,
+                    attempts = attempts,
+                    "Bundle confirmation timed out after {}s",
+                    timeout_secs,
+                );
+                return Ok(BundleConfirmation::Timeout);
+            }
+
+            attempts += 1;
+
+            match self.get_bundle_status(bundle_id).await {
+                Ok(raw) => {
+                    if let Ok(parsed) = serde_json::from_str::<BundleStatusResponse>(&raw) {
+                        if let Some(result) = parsed.result {
+                            for entry in &result.value {
+                                if entry.bundle_id == bundle_id {
+                                    match entry.status.as_str() {
+                                        "Landed" | "Finalized" => {
+                                            info!(
+                                                bundle_id = %bundle_id,
+                                                status = %entry.status,
+                                                landed_slot = ?entry.landed_slot,
+                                                attempts = attempts,
+                                                "Bundle confirmed on-chain"
+                                            );
+                                            return Ok(BundleConfirmation::Landed {
+                                                slot: entry.landed_slot,
+                                            });
+                                        }
+                                        "Failed" | "Invalid" => {
+                                            warn!(
+                                                bundle_id = %bundle_id,
+                                                status = %entry.status,
+                                                attempts = attempts,
+                                                "Bundle rejected by block engine"
+                                            );
+                                            return Ok(BundleConfirmation::Failed {
+                                                status: entry.status.clone(),
+                                            });
+                                        }
+                                        other => {
+                                            debug!(
+                                                bundle_id = %bundle_id,
+                                                status = %other,
+                                                attempt = attempts,
+                                                "Bundle still pending"
+                                            );
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+                Err(e) => {
+                    warn!(
+                        bundle_id = %bundle_id,
+                        error = %e,
+                        attempt = attempts,
+                        "Failed to query bundle status, retrying"
+                    );
+                }
+            }
+
+            tokio::time::sleep(poll_interval).await;
+        }
+    }
+
+    // ── Internal helpers ────────────────────────────────────────
+
+    /// Query bundle status via JSON-RPC getBundleStatuses.
+    async fn get_bundle_status(&self, bundle_id: &str) -> Result<String> {
+        let request = JitoRpcRequest {
             jsonrpc: "2.0".to_string(),
             id: 1,
             method: "getBundleStatuses".to_string(),
-            params: vec![vec![bundle_id.to_string()]],
+            params: vec![serde_json::json!([bundle_id])],
         };
 
         let response = self
@@ -190,50 +350,12 @@ impl JitoClient {
         Ok(body)
     }
 
-    /// Poll for bundle confirmation up to `timeout_secs` seconds.
-    /// Returns `true` if the bundle landed/finalized, `false` otherwise.
-    pub async fn confirm_bundle(&self, bundle_id: &str, timeout_secs: u64) -> Result<bool> {
-        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(timeout_secs);
-
-        loop {
-            if tokio::time::Instant::now() >= deadline {
-                warn!(bundle_id = %bundle_id, "Bundle confirmation timed out");
-                return Ok(false);
-            }
-
-            let raw = self.get_bundle_status(bundle_id).await?;
-            if let Ok(parsed) = serde_json::from_str::<BundleStatusResponse>(&raw) {
-                if let Some(result) = parsed.result {
-                    for entry in &result.value {
-                        if entry.bundle_id == bundle_id {
-                            match entry.status.as_str() {
-                                "Landed" | "Finalized" => {
-                                    info!(
-                                        bundle_id = %bundle_id,
-                                        status = %entry.status,
-                                        landed_slot = ?entry.landed_slot,
-                                        "Bundle confirmed"
-                                    );
-                                    return Ok(true);
-                                }
-                                "Failed" | "Invalid" => {
-                                    warn!(
-                                        bundle_id = %bundle_id,
-                                        status = %entry.status,
-                                        "Bundle failed"
-                                    );
-                                    return Ok(false);
-                                }
-                                _ => {
-                                    // Still pending, continue polling
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-
-            tokio::time::sleep(std::time::Duration::from_secs(2)).await;
-        }
+    /// Pick a random tip account from the known Jito tip account list.
+    fn random_tip_account() -> Result<Pubkey> {
+        let mut rng = rand::thread_rng();
+        let idx = rng.gen_range(0..JITO_TIP_ACCOUNTS.len());
+        JITO_TIP_ACCOUNTS[idx]
+            .parse()
+            .context("Failed to parse Jito tip account")
     }
 }

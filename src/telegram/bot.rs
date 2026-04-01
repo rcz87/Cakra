@@ -4,9 +4,11 @@ use anyhow::Result;
 use teloxide::prelude::*;
 use teloxide::types::ParseMode;
 use teloxide::utils::command::BotCommands;
+use tracing::warn;
 
 use super::BotState;
 use super::{buy_ui, history_ui, menu, positions_ui, settings_ui, sniper_ui, wallet_ui};
+use crate::db::queries as db;
 use crate::models::UserSettings;
 
 /// All available slash-commands for the bot.
@@ -75,10 +77,15 @@ pub async fn handle_callback(
 
     // Route based on prefix
     if data == "menu" {
-        let settings = UserSettings::default(); // TODO: load from DB
-        let balance = 0.0_f64; // TODO: fetch real balance
-        let positions_count = 0_usize;
-        let daily_pnl = 0.0_f64;
+        let settings = db::get_settings(&state.db, chat_id.0).unwrap_or_else(|e| {
+            warn!("Failed to load settings for chat {}: {}", chat_id.0, e);
+            UserSettings { chat_id: chat_id.0, ..Default::default() }
+        });
+        let balance = 0.0_f64; // TODO: fetch real balance via RPC when available in BotState
+        let positions_count = db::get_open_positions(&state.db)
+            .map(|p| p.len())
+            .unwrap_or(0);
+        let daily_pnl = db::get_daily_pnl(&state.db).unwrap_or(0.0);
 
         let text = menu::format_main_menu_text(balance, positions_count, daily_pnl, settings.sniper_enabled);
         let kb = menu::build_main_menu(balance, positions_count, daily_pnl, settings.sniper_enabled);
@@ -88,8 +95,15 @@ pub async fn handle_callback(
             .reply_markup(kb)
             .await?;
     } else if data == "snipe_toggle" {
-        let settings = UserSettings::default(); // TODO: load & toggle
-        let (text, kb) = sniper_ui::build_sniper_message(!settings.sniper_enabled, &settings);
+        let mut settings = db::get_settings(&state.db, chat_id.0).unwrap_or_else(|e| {
+            warn!("Failed to load settings for snipe_toggle: {}", e);
+            UserSettings { chat_id: chat_id.0, ..Default::default() }
+        });
+        settings.sniper_enabled = !settings.sniper_enabled;
+        if let Err(e) = db::save_settings(&state.db, &settings) {
+            warn!("Failed to save settings after snipe_toggle: {}", e);
+        }
+        let (text, kb) = sniper_ui::build_sniper_message(settings.sniper_enabled, &settings);
         bot.send_message(chat_id, text)
             .parse_mode(ParseMode::Html)
             .reply_markup(kb)
@@ -124,33 +138,40 @@ pub async fn handle_callback(
         // Format: sell:<pct>:<mint>
         let parts: Vec<&str> = rest.splitn(2, ':').collect();
         if parts.len() == 2 {
-            let pct = parts[0];
-            let mint = parts[1];
-            bot.send_message(
-                chat_id,
-                format!("\u{1f4e4} Sell {}% of `{}`\n\u{23f3} Processing...", pct, mint),
-            )
-            .await?;
-            // TODO: execute sell via executor module
+            if let Ok(pct) = parts[0].parse::<u8>() {
+                let mint = parts[1].to_string();
+                bot.send_message(
+                    chat_id,
+                    format!("\u{1f4e4} Sell {}% of `{}`\n\u{23f3} Processing...", pct, &mint),
+                )
+                .await?;
+                if let Err(e) = state.sell_tx.send((mint, pct)).await {
+                    warn!("Failed to dispatch sell command: {}", e);
+                    bot.send_message(chat_id, "\u{274c} Failed to submit sell order.").await?;
+                }
+            }
         }
     } else if data == "positions" {
         handle_positions_cb(&bot, chat_id, &state).await?;
     } else if data == "settings" {
-        let settings = UserSettings::default(); // TODO: load from DB
+        let settings = db::get_settings(&state.db, chat_id.0).unwrap_or_else(|e| {
+            warn!("Failed to load settings for chat {}: {}", chat_id.0, e);
+            UserSettings { chat_id: chat_id.0, ..Default::default() }
+        });
         let (text, kb) = settings_ui::build_settings_message(&settings);
         bot.send_message(chat_id, text)
             .parse_mode(ParseMode::Html)
             .reply_markup(kb)
             .await?;
     } else if data == "wallet" {
-        let wallets = vec![]; // TODO: load from DB
+        let wallets = load_wallet_infos(&state.db);
         let (text, kb) = wallet_ui::build_wallet_message(&wallets);
         bot.send_message(chat_id, text)
             .parse_mode(ParseMode::Html)
             .reply_markup(kb)
             .await?;
     } else if data == "history" {
-        let trades = vec![]; // TODO: load from DB
+        let trades = db::get_recent_trades(&state.db, 20).unwrap_or_default();
         let text = history_ui::build_history_message(&trades);
         bot.send_message(chat_id, text)
             .parse_mode(ParseMode::Html)
@@ -167,12 +188,18 @@ pub async fn handle_callback(
 async fn handle_start(
     bot: Bot,
     msg: Message,
-    _state: Arc<BotState>,
+    state: Arc<BotState>,
 ) -> Result<(), teloxide::RequestError> {
-    let settings = UserSettings::default(); // TODO: load from DB
-    let balance = 0.0_f64;
-    let positions_count = 0_usize;
-    let daily_pnl = 0.0_f64;
+    let chat_id = msg.chat.id.0;
+    let settings = db::get_settings(&state.db, chat_id).unwrap_or_else(|e| {
+        warn!("Failed to load settings for chat {}: {}", chat_id, e);
+        UserSettings { chat_id, ..Default::default() }
+    });
+    let balance = 0.0_f64; // TODO: fetch real balance via RPC when available in BotState
+    let positions_count = db::get_open_positions(&state.db)
+        .map(|p| p.len())
+        .unwrap_or(0);
+    let daily_pnl = db::get_daily_pnl(&state.db).unwrap_or(0.0);
 
     let text = menu::format_main_menu_text(balance, positions_count, daily_pnl, settings.sniper_enabled);
     let kb = menu::build_main_menu(balance, positions_count, daily_pnl, settings.sniper_enabled);
@@ -216,11 +243,17 @@ Aktifkan sniper untuk auto-buy token baru yang lolos security check dengan skor 
 async fn handle_snipe(
     bot: Bot,
     msg: Message,
-    _state: Arc<BotState>,
+    state: Arc<BotState>,
 ) -> Result<(), teloxide::RequestError> {
-    let mut settings = UserSettings::default(); // TODO: load from DB
+    let chat_id = msg.chat.id.0;
+    let mut settings = db::get_settings(&state.db, chat_id).unwrap_or_else(|e| {
+        warn!("Failed to load settings for snipe toggle: {}", e);
+        UserSettings { chat_id, ..Default::default() }
+    });
     settings.sniper_enabled = !settings.sniper_enabled;
-    // TODO: save to DB
+    if let Err(e) = db::save_settings(&state.db, &settings) {
+        warn!("Failed to save settings after snipe toggle: {}", e);
+    }
 
     let (text, kb) = sniper_ui::build_sniper_message(settings.sniper_enabled, &settings);
     bot.send_message(msg.chat.id, text)
@@ -259,7 +292,7 @@ async fn handle_buy(
 async fn handle_sell(
     bot: Bot,
     msg: Message,
-    _state: Arc<BotState>,
+    state: Arc<BotState>,
     args: String,
 ) -> Result<(), teloxide::RequestError> {
     let parts: Vec<&str> = args.trim().split_whitespace().collect();
@@ -270,7 +303,15 @@ async fn handle_sell(
     }
 
     let mint = parts[0];
-    let pct = parts[1];
+    let pct_str = parts[1];
+
+    let pct: u8 = match pct_str.parse() {
+        Ok(v) if v >= 1 && v <= 100 => v,
+        _ => {
+            bot.send_message(msg.chat.id, "\u{274c} Percentage must be 1-100").await?;
+            return Ok(());
+        }
+    };
 
     bot.send_message(
         msg.chat.id,
@@ -282,24 +323,31 @@ async fn handle_sell(
     .parse_mode(ParseMode::Html)
     .await?;
 
-    // TODO: execute sell via executor module
+    if let Err(e) = state.sell_tx.send((mint.to_string(), pct)).await {
+        warn!("Failed to dispatch sell command: {}", e);
+        bot.send_message(msg.chat.id, "\u{274c} Failed to submit sell order.").await?;
+    }
+
     Ok(())
 }
 
 async fn handle_positions(
     bot: Bot,
     msg: Message,
-    _state: Arc<BotState>,
+    state: Arc<BotState>,
 ) -> Result<(), teloxide::RequestError> {
-    handle_positions_cb(&bot, msg.chat.id, &_state).await
+    handle_positions_cb(&bot, msg.chat.id, &state).await
 }
 
 async fn handle_positions_cb(
     bot: &Bot,
     chat_id: ChatId,
-    _state: &Arc<BotState>,
+    state: &Arc<BotState>,
 ) -> Result<(), teloxide::RequestError> {
-    let positions: Vec<crate::models::Position> = vec![]; // TODO: load from DB
+    let positions = db::get_open_positions(&state.db).unwrap_or_else(|e| {
+        warn!("Failed to load open positions: {}", e);
+        vec![]
+    });
 
     if positions.is_empty() {
         bot.send_message(chat_id, "\u{1f4ad} Tidak ada posisi aktif saat ini.")
@@ -318,9 +366,9 @@ async fn handle_positions_cb(
 async fn handle_wallet(
     bot: Bot,
     msg: Message,
-    _state: Arc<BotState>,
+    state: Arc<BotState>,
 ) -> Result<(), teloxide::RequestError> {
-    let wallets: Vec<wallet_ui::WalletInfo> = vec![]; // TODO: load from DB
+    let wallets = load_wallet_infos(&state.db);
     let (text, kb) = wallet_ui::build_wallet_message(&wallets);
     bot.send_message(msg.chat.id, text)
         .parse_mode(ParseMode::Html)
@@ -332,9 +380,13 @@ async fn handle_wallet(
 async fn handle_settings(
     bot: Bot,
     msg: Message,
-    _state: Arc<BotState>,
+    state: Arc<BotState>,
 ) -> Result<(), teloxide::RequestError> {
-    let settings = UserSettings::default(); // TODO: load from DB
+    let chat_id = msg.chat.id.0;
+    let settings = db::get_settings(&state.db, chat_id).unwrap_or_else(|e| {
+        warn!("Failed to load settings for chat {}: {}", chat_id, e);
+        UserSettings { chat_id, ..Default::default() }
+    });
     let (text, kb) = settings_ui::build_settings_message(&settings);
     bot.send_message(msg.chat.id, text)
         .parse_mode(ParseMode::Html)
@@ -346,12 +398,40 @@ async fn handle_settings(
 async fn handle_history(
     bot: Bot,
     msg: Message,
-    _state: Arc<BotState>,
+    state: Arc<BotState>,
 ) -> Result<(), teloxide::RequestError> {
-    let trades: Vec<crate::models::Trade> = vec![]; // TODO: load from DB
+    let trades = db::get_recent_trades(&state.db, 20).unwrap_or_else(|e| {
+        warn!("Failed to load recent trades: {}", e);
+        vec![]
+    });
     let text = history_ui::build_history_message(&trades);
     bot.send_message(msg.chat.id, text)
         .parse_mode(ParseMode::Html)
         .await?;
     Ok(())
+}
+
+// ── Helpers ────────────────────────────────────────────────────────────
+
+/// Load wallets from DB and convert to `WalletInfo` structs for the UI.
+fn load_wallet_infos(db_pool: &crate::db::DbPool) -> Vec<wallet_ui::WalletInfo> {
+    match db::get_wallets(db_pool) {
+        Ok(rows) => rows
+            .into_iter()
+            .enumerate()
+            .map(|(i, (_id, pubkey, _enc_privkey, label, is_active))| {
+                wallet_ui::WalletInfo {
+                    index: i as u32,
+                    pubkey,
+                    balance_sol: 0.0, // TODO: fetch real balance via RPC when available
+                    is_active,
+                    label,
+                }
+            })
+            .collect(),
+        Err(e) => {
+            warn!("Failed to load wallets: {}", e);
+            vec![]
+        }
+    }
 }

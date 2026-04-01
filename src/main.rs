@@ -21,7 +21,9 @@ use crate::config::Config;
 use crate::monitoring::init_logging;
 use crate::risk::{CooldownManager, ListManager, RiskManager};
 use crate::telegram::TelegramBot;
+use crate::wallet::WalletManager;
 
+use crate::analyzer::entry_confirmation::{confirm_entry, EntryConfirmation, EntryDecision};
 use crate::analyzer::AnalyzerService;
 use crate::detector::DetectorService;
 use crate::executor::positions::PositionManager;
@@ -81,9 +83,21 @@ async fn main() -> Result<()> {
         warn!(error = %e, "Failed to load positions from database");
     }
 
+    // ── Wallet Manager (shared for buy/sell) ─────────────────────
+    let wallet_password = std::env::var("WALLET_PASSWORD").unwrap_or_default();
+    if wallet_password.is_empty() {
+        warn!("WALLET_PASSWORD is not set — wallet operations will fail. Set it in .env or environment.");
+    }
+    let wallet_manager = Arc::new(
+        WalletManager::new(&config, db.clone()).expect("Failed to create wallet manager"),
+    );
+
     let executor = Arc::new(ExecutorService::new(
         Arc::new(config.clone()),
         db.clone(),
+        RiskManager::new(config.clone(), db.clone()),
+        CooldownManager::new(config.trade_cooldown_secs),
+        ListManager::new(db.clone()),
     ));
 
     // ── Channel: Detector → Analyzer ───────────────────────────
@@ -117,6 +131,8 @@ async fn main() -> Result<()> {
     let analyzer_config = config.clone();
     let analyzer_db = db.clone();
     let analyzer_executor = executor.clone();
+    let analyzer_wallet = wallet_manager.clone();
+    let analyzer_password = wallet_password.clone();
     let mut analyzer_shutdown = shutdown_tx.subscribe();
     let analyzer_handle = tokio::spawn(async move {
         info!("Analyzer pipeline starting...");
@@ -181,15 +197,68 @@ async fn main() -> Result<()> {
                                     analyzer_config.min_score_auto_buy
                                 );
 
-                                // TODO: Get wallet keypair from wallet manager
-                                // TODO: Execute buy via executor
-                                // For now, log the intent. Full wiring requires
-                                // wallet access which needs user password.
-                                info!(
-                                    mint = %token.mint,
-                                    amount = analyzer_config.max_buy_sol,
-                                    "Auto-buy queued (awaiting wallet integration)"
-                                );
+                                // Entry confirmation check
+                                match confirm_entry(&token, &analyzer_config.jupiter_api_url, &EntryConfirmation::default()).await {
+                                    Ok(EntryDecision::Proceed) => {
+                                        // Confirmed — continue to buy
+                                    }
+                                    Ok(EntryDecision::Reject(reason)) => {
+                                        warn!(
+                                            mint = %token.mint,
+                                            reason = %reason,
+                                            "Entry confirmation rejected, skipping buy"
+                                        );
+                                        continue;
+                                    }
+                                    Err(e) => {
+                                        warn!(
+                                            mint = %token.mint,
+                                            error = %e,
+                                            "Entry confirmation check failed, skipping buy"
+                                        );
+                                        continue;
+                                    }
+                                }
+
+                                // Get active wallet keypair
+                                match analyzer_wallet.get_active_wallet() {
+                                    Ok(Some(active)) => {
+                                        match analyzer_wallet.get_keypair(&active.pubkey, &analyzer_password) {
+                                            Ok(keypair) => {
+                                                let amount = analyzer_config.max_buy_sol;
+                                                let slippage = analyzer_config.default_slippage_bps;
+                                                match analyzer_executor.execute_buy(
+                                                    &token, amount, slippage, &keypair,
+                                                ).await {
+                                                    Ok(sig) => {
+                                                        info!(
+                                                            mint = %token.mint,
+                                                            signature = %sig,
+                                                            amount_sol = amount,
+                                                            "AUTO BUY executed successfully"
+                                                        );
+                                                    }
+                                                    Err(e) => {
+                                                        error!(
+                                                            mint = %token.mint,
+                                                            error = %e,
+                                                            "AUTO BUY failed"
+                                                        );
+                                                    }
+                                                }
+                                            }
+                                            Err(e) => {
+                                                error!(error = %e, "Failed to decrypt wallet keypair");
+                                            }
+                                        }
+                                    }
+                                    Ok(None) => {
+                                        warn!("No active wallet set — cannot auto-buy");
+                                    }
+                                    Err(e) => {
+                                        error!(error = %e, "Failed to get active wallet");
+                                    }
+                                }
                             } else if score >= analyzer_config.min_score_notify {
                                 info!(
                                     mint = %token.mint,
@@ -226,7 +295,7 @@ async fn main() -> Result<()> {
     });
 
     // ── Spawn Price Feed ───────────────────────────────────────
-    let price_feed = PriceFeed::new(&config.jupiter_api_url, 3);
+    let price_feed = PriceFeed::new(&config.jupiter_api_url, &config.jupiter_api_key, 3);
     let price_positions = position_manager.clone();
     let mut price_shutdown = shutdown_tx.subscribe();
     let price_handle = tokio::spawn(async move {
@@ -265,6 +334,7 @@ async fn main() -> Result<()> {
     });
 
     // ── Spawn TP/SL Command Processor ──────────────────────────
+    let bot_sell_tx = sell_tx.clone();
     let tpsl_cmd_handle = tokio::spawn(async move {
         info!("TP/SL command processor starting...");
         process_tp_sl_commands(tpsl_command_rx, sell_tx).await;
@@ -272,17 +342,50 @@ async fn main() -> Result<()> {
 
     // ── Spawn Sell Executor ────────────────────────────────────
     let sell_executor = executor.clone();
+    let sell_wallet = wallet_manager.clone();
+    let sell_password = wallet_password.clone();
     let sell_handle = tokio::spawn(async move {
         info!("Sell executor starting...");
         while let Some((mint, sell_pct)) = sell_rx.recv().await {
             info!(mint = %mint, sell_pct = sell_pct, "Processing sell command");
-            // TODO: Get wallet keypair for this position
-            // let result = sell_executor.execute_sell(&mint, sell_pct, &wallet).await;
-            warn!(
-                mint = %mint,
-                sell_pct = sell_pct,
-                "Sell execution pending wallet integration"
-            );
+
+            // Get active wallet keypair for selling
+            let keypair = match sell_wallet.get_active_wallet() {
+                Ok(Some(active)) => match sell_wallet.get_keypair(&active.pubkey, &sell_password) {
+                    Ok(kp) => kp,
+                    Err(e) => {
+                        error!(error = %e, "Failed to decrypt wallet for sell");
+                        continue;
+                    }
+                },
+                Ok(None) => {
+                    warn!("No active wallet set — cannot execute sell");
+                    continue;
+                }
+                Err(e) => {
+                    error!(error = %e, "Failed to get active wallet for sell");
+                    continue;
+                }
+            };
+
+            match sell_executor.execute_sell(&mint, sell_pct, &keypair).await {
+                Ok(sig) => {
+                    info!(
+                        mint = %mint,
+                        sell_pct = sell_pct,
+                        signature = %sig,
+                        "Sell executed successfully"
+                    );
+                }
+                Err(e) => {
+                    error!(
+                        mint = %mint,
+                        sell_pct = sell_pct,
+                        error = %e,
+                        "Sell execution failed"
+                    );
+                }
+            }
         }
     });
 
@@ -291,7 +394,7 @@ async fn main() -> Result<()> {
     let bot_config = config.clone();
     let bot_db = db.clone();
     let bot_handle = tokio::spawn(async move {
-        if let Err(e) = TelegramBot::start(bot_config, bot_db).await {
+        if let Err(e) = TelegramBot::start(bot_config, bot_db, bot_sell_tx).await {
             error!(err = %e, "Telegram bot exited with error");
         }
     });

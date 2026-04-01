@@ -32,6 +32,8 @@ struct RouteCandidate {
     price_impact: f64,
 }
 
+const MAX_PRICE_IMPACT_PCT: f64 = 10.0;
+
 const WSOL_MINT: &str = "So11111111111111111111111111111111111111112";
 
 /// How many seconds a token must be younger than to try PumpFun direct
@@ -75,25 +77,34 @@ pub async fn find_best_route(
                 "Jupiter quote received"
             );
 
-            let min_output = calculate_min_output(candidate.expected_output, slippage_bps);
+            // Reject routes with excessive price impact
+            if candidate.price_impact > MAX_PRICE_IMPACT_PCT {
+                warn!(price_impact = candidate.price_impact, "Route rejected: price impact > 10%");
+                // Fall through to PumpFun fallback or error
+            } else if candidate.expected_output == 0 {
+                warn!("Route rejected: expected output is 0");
+                // Fall through to PumpFun fallback or error
+            } else {
+                let min_output = calculate_min_output(candidate.expected_output, slippage_bps);
 
-            let route = Route {
-                route_type: candidate.route_type,
-                expected_output: candidate.expected_output,
-                min_output,
-                price_impact_pct: candidate.price_impact,
-                estimated_fee_lamports: 5000,
-            };
+                let route = Route {
+                    route_type: candidate.route_type,
+                    expected_output: candidate.expected_output,
+                    min_output,
+                    price_impact_pct: candidate.price_impact,
+                    estimated_fee_lamports: 0,
+                };
 
-            info!(
-                route = ?route.route_type,
-                expected_output = route.expected_output,
-                min_output = route.min_output,
-                price_impact = route.price_impact_pct,
-                "Best route selected via Jupiter"
-            );
+                info!(
+                    route = ?route.route_type,
+                    expected_output = route.expected_output,
+                    min_output = route.min_output,
+                    price_impact = route.price_impact_pct,
+                    "Best route selected via Jupiter"
+                );
 
-            return Ok(route);
+                return Ok(route);
+            }
         }
         Err(e) => {
             warn!("Jupiter quote failed: {e}");
@@ -119,6 +130,11 @@ pub async fn find_best_route(
                     "PumpFun direct quote received"
                 );
 
+                // Mark PumpFun routes as low-confidence estimates
+                if candidate.price_impact > 20.0 {
+                    warn!("PumpFun fallback has very high estimated price impact");
+                }
+
                 let min_output = calculate_min_output(candidate.expected_output, slippage_bps);
 
                 let route = Route {
@@ -126,7 +142,7 @@ pub async fn find_best_route(
                     expected_output: candidate.expected_output,
                     min_output,
                     price_impact_pct: candidate.price_impact,
-                    estimated_fee_lamports: 5000,
+                    estimated_fee_lamports: 0,
                 };
 
                 info!(

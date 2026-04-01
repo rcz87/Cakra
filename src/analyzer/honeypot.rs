@@ -116,13 +116,12 @@ pub async fn simulate_honeypot(
         .context("Failed to parse sell quote out_amount")?;
 
     // --- Step 3: Compute taxes ---
-    let buy_input = SIM_AMOUNT_LAMPORTS as f64;
-    let buy_output_sol_value = sol_returned as f64; // what we'd get back
-    // Buy tax: how much value is lost on the buy side.
-    // If no tax, selling immediately should return ~SIM_AMOUNT_LAMPORTS (minus AMM fees).
-    // We compare the round-trip to estimate combined tax, then split it.
-    let round_trip_loss_pct = if buy_input > 0.0 {
-        ((buy_input - buy_output_sol_value) / buy_input * 100.0).max(0.0)
+    // Round-trip estimation: buy SOL→token, then sell token→SOL.
+    // The difference between input and final output reveals combined tax + fees.
+    let input_lamports = SIM_AMOUNT_LAMPORTS as f64;
+    let output_lamports = sol_returned as f64;
+    let round_trip_loss_pct = if input_lamports > 0.0 {
+        ((input_lamports - output_lamports) / input_lamports * 100.0).max(0.0)
     } else {
         0.0
     };

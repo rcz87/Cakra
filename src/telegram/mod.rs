@@ -14,6 +14,7 @@ pub use bot::Command;
 use anyhow::Result;
 use teloxide::prelude::*;
 use std::sync::Arc;
+use tokio::sync::mpsc;
 
 use crate::config::Config;
 use crate::db::DbPool;
@@ -23,19 +24,22 @@ use crate::db::DbPool;
 pub struct BotState {
     pub config: Config,
     pub db: DbPool,
+    /// Channel to dispatch sell commands (mint, sell_pct) to the sell executor.
+    pub sell_tx: mpsc::Sender<(String, u8)>,
 }
 
 pub struct TelegramBot;
 
 impl TelegramBot {
     /// Start the Telegram bot, register all handlers, and begin polling.
-    pub async fn start(config: Config, db: DbPool) -> Result<()> {
+    pub async fn start(config: Config, db: DbPool, sell_tx: mpsc::Sender<(String, u8)>) -> Result<()> {
         tracing::info!("Starting RICOZ SNIPER Telegram bot...");
 
         let bot = Bot::new(&config.telegram_bot_token);
         let state = Arc::new(BotState {
             config: config.clone(),
             db,
+            sell_tx,
         });
 
         let handler = dptree::entry()

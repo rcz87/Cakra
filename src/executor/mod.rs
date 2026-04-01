@@ -16,7 +16,8 @@ use solana_client::rpc_client::RpcClient;
 use solana_sdk::pubkey::Pubkey;
 use solana_sdk::signer::keypair::Keypair;
 use solana_sdk::signer::Signer;
-use tracing::{info, warn};
+use solana_sdk::transaction::Transaction;
+use tracing::info;
 
 use crate::config::Config;
 use crate::db::DbPool;
@@ -24,7 +25,7 @@ use crate::models::token::TokenInfo;
 use crate::risk::{RiskManager, CooldownManager, ListManager, RiskCheck};
 
 use self::jito::JitoClient;
-use self::jupiter::JupiterClient;
+use self::jupiter::{JupiterClient, to_solana_instruction};
 use self::positions::PositionManager;
 use self::retry::retry_with_backoff;
 
@@ -125,76 +126,105 @@ impl ExecutorService {
         let wsol_mint = "So11111111111111111111111111111111111111112";
         let taker = wallet.pubkey().to_string();
 
-        // Request Ultra order (Jupiter handles routing, priority fees, MEV protection)
-        let order = retry_with_backoff(
+        // 1. Get a quote from Jupiter Swap API
+        let quote = retry_with_backoff(
             || {
                 let jupiter = self.jupiter.clone();
                 let mint = token.mint.clone();
-                let taker = taker.clone();
                 async move {
                     jupiter
-                        .get_order(wsol_mint, &mint, amount_lamports, &taker)
+                        .get_quote(wsol_mint, &mint, amount_lamports, slippage_bps)
                         .await
                 }
             },
             3,
         )
         .await
-        .context("Failed to get Ultra order")?;
+        .context("Failed to get Jupiter quote")?;
 
-        let expected_output: u64 = order.out_amount.parse().unwrap_or(0);
+        let expected_output: u64 = quote.out_amount.parse().unwrap_or(0);
         info!(
-            request_id = %order.request_id,
             expected_output = expected_output,
-            slippage_bps = ?order.slippage_bps,
-            "Ultra order received"
+            slippage_bps = slippage_bps,
+            price_impact = %quote.price_impact_pct,
+            "Jupiter quote received for buy"
         );
 
-        // Sign and execute — Jupiter handles landing + MEV protection
-        let (signature, actual_input, actual_output) = self
+        // 2. Get swap instructions from Jupiter
+        let swap_ixs = self
             .jupiter
-            .sign_and_execute(&order, wallet)
+            .get_swap_instructions(&quote, &taker)
             .await
-            .context("Ultra swap execution failed")?;
+            .context("Failed to get Jupiter swap instructions")?;
 
-        info!(
-            signature = %signature,
-            actual_input = actual_input,
-            actual_output = actual_output,
-            "Buy confirmed via Ultra"
-        );
-
-        if actual_output == 0 {
-            anyhow::bail!(
-                "Ultra swap returned 0 output for mint {} — swap may have failed",
-                token.mint
-            );
+        // 3. Build transaction from instructions
+        let mut instructions = Vec::new();
+        for ix in &swap_ixs.compute_budget_instructions {
+            instructions.push(to_solana_instruction(ix)?);
         }
-
-        // Validate slippage: compare expected vs actual output
-        if expected_output > 0 {
-            let slippage_pct =
-                ((expected_output as f64 - actual_output as f64) / expected_output as f64) * 100.0;
-            info!(
-                expected = expected_output,
-                actual = actual_output,
-                slippage_pct = format!("{:.2}", slippage_pct),
-                "Post-execution slippage check"
-            );
-            if slippage_pct > 5.0 {
-                warn!(
-                    slippage_pct = format!("{:.2}", slippage_pct),
-                    expected = expected_output,
-                    actual = actual_output,
-                    mint = %token.mint,
-                    "High post-execution slippage detected (>5%)"
-                );
+        for ix in &swap_ixs.setup_instructions {
+            instructions.push(to_solana_instruction(ix)?);
+        }
+        instructions.push(to_solana_instruction(&swap_ixs.swap_instruction)?);
+        if let Some(cleanup) = &swap_ixs.cleanup_instruction {
+            instructions.push(to_solana_instruction(cleanup)?);
+        }
+        if let Some(other) = &swap_ixs.other_instructions {
+            for ix in other {
+                instructions.push(to_solana_instruction(ix)?);
             }
         }
 
-        // Track the position using actual execution results
-        let entry_price = if actual_output > 0 {
-            amount_sol / (actual_output as f64)
+        let recent_blockhash = self
+            .rpc
+            .get_latest_blockhash()
+            .context("Failed to get recent blockhash")?;
+
+        let swap_tx = Transaction::new_signed_with_payer(
+            &instructions,
+            Some(&wallet.pubkey()),
+            &[wallet],
+            recent_blockhash,
+        );
+
+        // 4. Submit via Jito bundle for MEV protection
+        let bundle_id = self
+            .jito
+            .submit_bundle(
+                vec![swap_tx],
+                self.config.jito_tip_lamports,
+                wallet,
+                recent_blockhash,
+            )
+            .await
+            .context("Failed to submit buy bundle to Jito")?;
+
+        // 5. Confirm the bundle landed
+        let confirmation = self
+            .jito
+            .confirm_bundle(&bundle_id, 60)
+            .await
+            .context("Failed to confirm buy bundle")?;
+
+        if !confirmation.is_landed() {
+            anyhow::bail!(
+                "Buy bundle did not land for mint {} (bundle_id: {})",
+                token.mint,
+                bundle_id
+            );
+        }
+
+        let signature = bundle_id.clone();
+
+        info!(
+            bundle_id = %bundle_id,
+            expected_output = expected_output,
+            "Buy confirmed via Jito bundle"
+        );
+
+        // Track the position using expected output from quote
+        let entry_price = if expected_output > 0 {
+            amount_sol / (expected_output as f64)
         } else {
             0.0
         };
@@ -205,9 +235,10 @@ impl ExecutorService {
             &taker,
             entry_price,
             amount_sol,
-            actual_output as f64,
+            expected_output as f64,
             self.config.default_slippage_bps,
             &signature,
+            0, // security_score: caller can override when available
         )?;
 
         // Record trade for cooldown tracking
@@ -276,41 +307,103 @@ impl ExecutorService {
             total_balance = total_amount,
             sell_pct = amount_pct,
             sell_amount = sell_amount,
-            "Selling via Ultra API"
+            "Selling via Jupiter Swap API"
         );
 
-        // Use Ultra API: token → SOL
-        let order = retry_with_backoff(
+        // 1. Get a quote: token → SOL
+        let default_slippage = self.config.default_slippage_bps;
+        let quote = retry_with_backoff(
             || {
                 let jupiter = self.jupiter.clone();
                 let mint = mint.to_string();
-                let taker = taker.clone();
                 async move {
                     jupiter
-                        .get_order(&mint, wsol_mint, sell_amount, &taker)
+                        .get_quote(&mint, wsol_mint, sell_amount, default_slippage)
                         .await
                 }
             },
             3,
         )
         .await
-        .context("Failed to get Ultra sell order")?;
+        .context("Failed to get Jupiter sell quote")?;
 
-        let (signature, _actual_input, actual_sol_output) = self
+        // 2. Get swap instructions
+        let swap_ixs = self
             .jupiter
-            .sign_and_execute(&order, wallet)
+            .get_swap_instructions(&quote, &taker)
             .await
-            .context("Ultra sell execution failed")?;
+            .context("Failed to get Jupiter swap instructions for sell")?;
 
-        info!(
-            signature = %signature,
-            sol_received = actual_sol_output,
-            "Sell confirmed via Ultra"
+        // 3. Build transaction from instructions
+        let mut instructions = Vec::new();
+        for ix in &swap_ixs.compute_budget_instructions {
+            instructions.push(to_solana_instruction(ix)?);
+        }
+        for ix in &swap_ixs.setup_instructions {
+            instructions.push(to_solana_instruction(ix)?);
+        }
+        instructions.push(to_solana_instruction(&swap_ixs.swap_instruction)?);
+        if let Some(cleanup) = &swap_ixs.cleanup_instruction {
+            instructions.push(to_solana_instruction(cleanup)?);
+        }
+        if let Some(other) = &swap_ixs.other_instructions {
+            for ix in other {
+                instructions.push(to_solana_instruction(ix)?);
+            }
+        }
+
+        let recent_blockhash = self
+            .rpc
+            .get_latest_blockhash()
+            .context("Failed to get recent blockhash for sell")?;
+
+        let swap_tx = Transaction::new_signed_with_payer(
+            &instructions,
+            Some(&wallet.pubkey()),
+            &[wallet],
+            recent_blockhash,
         );
 
-        // Close position if 100% sell
-        if amount_pct == 100 {
+        // 4. Submit via Jito bundle
+        let bundle_id = self
+            .jito
+            .submit_bundle(
+                vec![swap_tx],
+                self.config.jito_tip_lamports,
+                wallet,
+                recent_blockhash,
+            )
+            .await
+            .context("Failed to submit sell bundle to Jito")?;
+
+        // 5. Confirm the bundle landed
+        let confirmation = self
+            .jito
+            .confirm_bundle(&bundle_id, 60)
+            .await
+            .context("Failed to confirm sell bundle")?;
+
+        if !confirmation.is_landed() {
+            anyhow::bail!(
+                "Sell bundle did not land for mint {} (bundle_id: {})",
+                mint,
+                bundle_id
+            );
+        }
+
+        let signature = bundle_id.clone();
+
+        info!(
+            bundle_id = %bundle_id,
+            expected_sol = %quote.out_amount,
+            "Sell confirmed via Jito bundle"
+        );
+
+        // Update position tracking
+        if amount_pct >= 100 {
             self.positions.close_position(mint, &signature)?;
+        } else {
+            self.positions.reduce_position(mint, amount_pct, &signature)?;
         }
 
         Ok(signature)

@@ -47,6 +47,7 @@ impl PositionManager {
         token_amount: f64,
         _slippage_bps: u16,
         buy_tx: &str,
+        security_score: u8,
     ) -> Result<Position> {
         let position = Position {
             id: Uuid::new_v4().to_string(),
@@ -68,7 +69,7 @@ impl PositionManager {
             sell_tx: None,
             opened_at: Utc::now(),
             closed_at: None,
-            security_score: 0,
+            security_score,
             age_secs: 0,
         };
 
@@ -177,6 +178,31 @@ impl PositionManager {
         Ok(())
     }
 
+    /// Reduce token amount after a partial sell. Does NOT close the position.
+    pub fn reduce_position(&self, mint: &str, sell_pct: u8, sell_tx: &str) -> Result<()> {
+        let mut positions = self
+            .positions
+            .write()
+            .map_err(|e| anyhow::anyhow!("Position lock poisoned: {e}"))?;
+
+        if let Some(pos) = positions.get_mut(mint) {
+            let reduction = pos.token_amount * (sell_pct as f64 / 100.0);
+            pos.token_amount -= reduction;
+            if pos.token_amount <= 0.0 {
+                // Fully sold
+                pos.token_amount = 0.0;
+                pos.status = PositionStatus::ClosedTp;
+                pos.sell_tx = Some(sell_tx.to_string());
+                pos.closed_at = Some(Utc::now());
+            }
+            let pos_clone = pos.clone();
+            drop(positions);
+            self.persist_position(&pos_clone)?;
+        }
+
+        Ok(())
+    }
+
     /// Get all currently open positions.
     pub fn get_open_positions(&self) -> Vec<Position> {
         let positions = self.positions.read().unwrap_or_else(|e| e.into_inner());
@@ -248,6 +274,10 @@ impl PositionManager {
                 trailing = ?trailing_stop_pct,
                 "TP/SL updated"
             );
+
+            let pos_clone = pos.clone();
+            drop(positions);
+            self.persist_position(&pos_clone)?;
         } else {
             anyhow::bail!("No position found for mint {mint}");
         }
@@ -292,7 +322,11 @@ impl PositionManager {
                     status: PositionStatus::Open,
                     buy_tx: row.get(15)?,
                     sell_tx: row.get(16)?,
-                    opened_at: Utc::now(), // simplified; parse from DB in production
+                    opened_at: row.get::<_, String>(17)
+                        .ok()
+                        .and_then(|s| chrono::DateTime::parse_from_rfc3339(&s).ok())
+                        .map(|dt| dt.with_timezone(&Utc))
+                        .unwrap_or_else(Utc::now),
                     closed_at: None,
                     security_score: row.get::<_, u32>(19).unwrap_or(0) as u8,
                     age_secs: 0,

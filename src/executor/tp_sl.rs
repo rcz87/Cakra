@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -168,6 +168,14 @@ impl TpSlMonitor {
     /// Check all open positions for TP/SL triggers.
     async fn check_all_positions(&self) {
         let positions = self.positions.get_open_positions();
+
+        // Clean up triggered tiers for closed positions
+        {
+            let open_mints: HashSet<String> =
+                positions.iter().map(|p| p.token_mint.clone()).collect();
+            let mut triggered = self.triggered_tiers.lock().await;
+            triggered.retain(|mint, _| open_mints.contains(mint));
+        }
 
         if positions.is_empty() {
             return;

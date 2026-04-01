@@ -7,7 +7,6 @@ pub mod pumpfun_buy;
 pub mod raydium;
 pub mod retry;
 pub mod router;
-pub mod sell;
 pub mod tp_sl;
 
 use std::sync::Arc;
@@ -17,23 +16,17 @@ use solana_client::rpc_client::RpcClient;
 use solana_sdk::pubkey::Pubkey;
 use solana_sdk::signer::keypair::Keypair;
 use solana_sdk::signer::Signer;
-use solana_sdk::transaction::Transaction;
-use tracing::{error, info, warn};
+use tracing::{info, warn};
 
 use crate::config::Config;
 use crate::db::DbPool;
-use crate::models::token::{TokenInfo, TokenSource};
+use crate::models::token::TokenInfo;
 use crate::risk::{RiskManager, CooldownManager, ListManager, RiskCheck};
 
 use self::jito::JitoClient;
 use self::jupiter::JupiterClient;
 use self::positions::PositionManager;
-use self::priority::calculate_priority_fee;
-use self::pumpfun_buy::build_pumpfun_buy;
-use self::raydium::build_raydium_swap;
 use self::retry::retry_with_backoff;
-use self::router::{find_best_route, Route, RouteType};
-use self::sell::build_sell_instruction;
 
 /// Central executor service that coordinates all trading operations
 /// for the RICOZ SNIPER bot.
@@ -129,99 +122,61 @@ impl ExecutorService {
         }
 
         let amount_lamports = (amount_sol * 1_000_000_000.0) as u64;
+        let wsol_mint = "So11111111111111111111111111111111111111112";
+        let taker = wallet.pubkey().to_string();
 
-        // Find the best route across all DEXes
-        let route = retry_with_backoff(
+        // Request Ultra order (Jupiter handles routing, priority fees, MEV protection)
+        let order = retry_with_backoff(
             || {
-                let token = token.clone();
                 let jupiter = self.jupiter.clone();
-                let rpc = self.rpc.clone();
-                let config = self.config.clone();
+                let mint = token.mint.clone();
+                let taker = taker.clone();
                 async move {
-                    find_best_route(&token, amount_lamports, slippage_bps, &jupiter, &rpc, &config)
+                    jupiter
+                        .get_order(wsol_mint, &mint, amount_lamports, &taker)
                         .await
                 }
             },
             3,
         )
         .await
-        .context("Failed to find route")?;
+        .context("Failed to get Ultra order")?;
+
+        let expected_output: u64 = order.out_amount.parse().unwrap_or(0);
+        info!(
+            request_id = %order.request_id,
+            expected_output = expected_output,
+            slippage_bps = ?order.slippage_bps,
+            "Ultra order received"
+        );
+
+        // Sign and execute — Jupiter handles landing + MEV protection
+        let (signature, actual_input, actual_output) = self
+            .jupiter
+            .sign_and_execute(&order, wallet)
+            .await
+            .context("Ultra swap execution failed")?;
 
         info!(
-            route = ?route.route_type,
-            expected_output = route.expected_output,
-            "Best route found"
+            signature = %signature,
+            actual_input = actual_input,
+            actual_output = actual_output,
+            "Buy confirmed via Ultra"
         );
-
-        // Build the transaction based on the chosen route
-        let tx = self
-            .build_transaction_for_route(&route, token, amount_lamports, slippage_bps, wallet)
-            .await
-            .context("Failed to build transaction")?;
-
-        // Calculate dynamic priority fee
-        let priority_fee = calculate_priority_fee(&self.rpc, 1.5).await.unwrap_or_else(|e| {
-            warn!("Failed to calculate priority fee, using default: {e}");
-            5000
-        });
-
-        info!(priority_fee = priority_fee, "Using priority fee");
-
-        // Submit via Jito bundle for MEV protection
-        let tip_lamports = self.config.jito_tip_lamports.max(priority_fee);
-        let signature = retry_with_backoff(
-            || {
-                let jito = self.jito.clone();
-                let tx = tx.clone();
-                let tip = tip_lamports;
-                async move { jito.submit_bundle(vec![tx], tip).await }
-            },
-            3,
-        )
-        .await
-        .context("Failed to submit Jito bundle")?;
-
-        info!(signature = %signature, "Buy transaction submitted");
-
-        // Confirm the bundle landed on-chain before creating a position
-        let confirmed = self.jito.confirm_bundle(&signature, 30).await?;
-        if !confirmed {
-            anyhow::bail!("Transaction not confirmed");
-        }
-
-        // Query actual token balance received on-chain
-        let mint_pubkey: Pubkey = token.mint.parse()
-            .context("Failed to parse token mint pubkey")?;
-        let token_program: Pubkey = "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA".parse().unwrap();
-        let ata_program: Pubkey = "ATokenGPvbdGVxr1b2hvZbsiqW5xWH25efTNsLJA8knL".parse().unwrap();
-        let (ata, _) = Pubkey::find_program_address(
-            &[wallet.pubkey().as_ref(), token_program.as_ref(), mint_pubkey.as_ref()],
-            &ata_program,
-        );
-        let actual_output = {
-            let balance = self
-                .rpc
-                .get_token_account_balance(&ata)
-                .context("Failed to query token account balance after buy")?;
-            balance
-                .amount
-                .parse::<u64>()
-                .context("Failed to parse token balance amount")?
-        };
 
         if actual_output == 0 {
             anyhow::bail!(
-                "Post-buy balance is 0 for mint {} — transaction may have failed silently",
+                "Ultra swap returned 0 output for mint {} — swap may have failed",
                 token.mint
             );
         }
 
         // Validate slippage: compare expected vs actual output
-        let expected = route.expected_output;
-        if expected > 0 {
-            let slippage_pct = ((expected as f64 - actual_output as f64) / expected as f64) * 100.0;
+        if expected_output > 0 {
+            let slippage_pct =
+                ((expected_output as f64 - actual_output as f64) / expected_output as f64) * 100.0;
             info!(
-                expected = expected,
+                expected = expected_output,
                 actual = actual_output,
                 slippage_pct = format!("{:.2}", slippage_pct),
                 "Post-execution slippage check"
@@ -229,15 +184,15 @@ impl ExecutorService {
             if slippage_pct > 5.0 {
                 warn!(
                     slippage_pct = format!("{:.2}", slippage_pct),
-                    expected = expected,
+                    expected = expected_output,
                     actual = actual_output,
                     mint = %token.mint,
-                    "High post-execution slippage detected (>{:.0}%)", 5.0
+                    "High post-execution slippage detected (>5%)"
                 );
             }
         }
 
-        // Track the new position using actual on-chain output
+        // Track the position using actual execution results
         let entry_price = if actual_output > 0 {
             amount_sol / (actual_output as f64)
         } else {
@@ -247,7 +202,7 @@ impl ExecutorService {
         self.positions.open_position(
             &token.mint,
             &token.symbol,
-            &wallet.pubkey().to_string(),
+            &taker,
             entry_price,
             amount_sol,
             actual_output as f64,
@@ -256,7 +211,7 @@ impl ExecutorService {
         )?;
 
         // Record trade for cooldown tracking
-        self.cooldown.record_trade(&wallet.pubkey().to_string());
+        self.cooldown.record_trade(&taker);
 
         Ok(signature)
     }
@@ -279,38 +234,79 @@ impl ExecutorService {
             anyhow::bail!("Invalid sell percentage: {amount_pct}. Must be 1-100");
         }
 
-        // Build sell instructions (handles token account lookup and amount calc)
-        let instructions =
-            build_sell_instruction(mint, amount_pct, &wallet.pubkey(), &self.rpc, &self.jupiter)
-                .await
-                .context("Failed to build sell instruction")?;
+        let wsol_mint = "So11111111111111111111111111111111111111112";
+        let taker = wallet.pubkey().to_string();
 
-        if instructions.is_empty() {
-            anyhow::bail!("No sell instructions generated - token balance may be zero");
-        }
-
-        let recent_blockhash = self.rpc.get_latest_blockhash()?;
-        let tx = Transaction::new_signed_with_payer(
-            &instructions,
-            Some(&wallet.pubkey()),
-            &[wallet],
-            recent_blockhash,
+        // Get token balance to calculate sell amount
+        let mint_pubkey: Pubkey = mint.parse().context("Invalid mint address")?;
+        let token_program: Pubkey = "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA"
+            .parse()
+            .unwrap();
+        let ata_program: Pubkey = "ATokenGPvbdGVxr1b2hvZbsiqW5xWH25efTNsLJA8knL"
+            .parse()
+            .unwrap();
+        let (ata, _) = Pubkey::find_program_address(
+            &[
+                wallet.pubkey().as_ref(),
+                token_program.as_ref(),
+                mint_pubkey.as_ref(),
+            ],
+            &ata_program,
         );
 
-        let tip_lamports = self.config.jito_tip_lamports;
-        let signature = retry_with_backoff(
+        let balance = self
+            .rpc
+            .get_token_account_balance(&ata)
+            .context("Failed to get token balance for sell")?;
+        let total_amount: u64 = balance
+            .amount
+            .parse()
+            .context("Failed to parse token balance")?;
+
+        if total_amount == 0 {
+            anyhow::bail!("Token balance is zero for mint {mint}");
+        }
+
+        let sell_amount = (total_amount as u128 * amount_pct as u128 / 100) as u64;
+        if sell_amount == 0 {
+            anyhow::bail!("Calculated sell amount is zero");
+        }
+
+        info!(
+            total_balance = total_amount,
+            sell_pct = amount_pct,
+            sell_amount = sell_amount,
+            "Selling via Ultra API"
+        );
+
+        // Use Ultra API: token → SOL
+        let order = retry_with_backoff(
             || {
-                let jito = self.jito.clone();
-                let tx = tx.clone();
-                let tip = tip_lamports;
-                async move { jito.submit_bundle(vec![tx], tip).await }
+                let jupiter = self.jupiter.clone();
+                let mint = mint.to_string();
+                let taker = taker.clone();
+                async move {
+                    jupiter
+                        .get_order(&mint, wsol_mint, sell_amount, &taker)
+                        .await
+                }
             },
             3,
         )
         .await
-        .context("Failed to submit sell bundle")?;
+        .context("Failed to get Ultra sell order")?;
 
-        info!(signature = %signature, "Sell transaction submitted");
+        let (signature, _actual_input, actual_sol_output) = self
+            .jupiter
+            .sign_and_execute(&order, wallet)
+            .await
+            .context("Ultra sell execution failed")?;
+
+        info!(
+            signature = %signature,
+            sol_received = actual_sol_output,
+            "Sell confirmed via Ultra"
+        );
 
         // Close position if 100% sell
         if amount_pct == 100 {
@@ -320,41 +316,4 @@ impl ExecutorService {
         Ok(signature)
     }
 
-    async fn build_transaction_for_route(
-        &self,
-        route: &Route,
-        token: &TokenInfo,
-        amount_lamports: u64,
-        slippage_bps: u16,
-        wallet: &Keypair,
-    ) -> Result<Transaction> {
-        let mint: solana_sdk::pubkey::Pubkey = token.mint.parse()?;
-
-        match route.route_type {
-            RouteType::PumpFun => {
-                let ix =
-                    build_pumpfun_buy(&mint, amount_lamports, slippage_bps, &wallet.pubkey())?;
-                let recent_blockhash = self.rpc.get_latest_blockhash()?;
-                Ok(Transaction::new_signed_with_payer(
-                    &[ix],
-                    Some(&wallet.pubkey()),
-                    &[wallet],
-                    recent_blockhash,
-                ))
-            }
-            RouteType::Jupiter => {
-                let wsol_mint = "So11111111111111111111111111111111111111112";
-                let quote = self
-                    .jupiter
-                    .get_quote(wsol_mint, &token.mint, amount_lamports, slippage_bps)
-                    .await?;
-                let tx = self
-                    .jupiter
-                    .build_swap_tx(&quote, &wallet.pubkey().to_string())
-                    .await?;
-                Ok(tx)
-            }
-            // Raydium is now routed through Jupiter aggregator
-        }
-    }
 }

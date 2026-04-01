@@ -230,6 +230,7 @@ pub fn get_open_positions(db: &DbPool) -> Result<Vec<Position>> {
                 .with_timezone(&chrono::Utc),
             closed_at: None,
             security_score: row.get::<_, Option<u8>>(16)?.unwrap_or(0),
+            age_secs: 0,
         })
     })?;
     Ok(rows.filter_map(|r| r.ok()).collect())

@@ -307,29 +307,7 @@ impl ExecutorService {
                     .await?;
                 Ok(tx)
             }
-            RouteType::Raydium => {
-                let pool_address = token
-                    .pool_address
-                    .as_ref()
-                    .context("No pool address for Raydium route")?;
-                let wsol_mint: solana_sdk::pubkey::Pubkey =
-                    "So11111111111111111111111111111111111111112".parse()?;
-                let ix = build_raydium_swap(
-                    pool_address,
-                    &wsol_mint,
-                    &mint,
-                    amount_lamports,
-                    route.min_output,
-                    &wallet.pubkey(),
-                )?;
-                let recent_blockhash = self.rpc.get_latest_blockhash()?;
-                Ok(Transaction::new_signed_with_payer(
-                    &[ix],
-                    Some(&wallet.pubkey()),
-                    &[wallet],
-                    recent_blockhash,
-                ))
-            }
+            // Raydium is now routed through Jupiter aggregator
         }
     }
 }

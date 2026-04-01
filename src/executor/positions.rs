@@ -69,6 +69,7 @@ impl PositionManager {
             opened_at: Utc::now(),
             closed_at: None,
             security_score: 0,
+            age_secs: 0,
         };
 
         // Insert into in-memory cache
@@ -294,6 +295,7 @@ impl PositionManager {
                     opened_at: Utc::now(), // simplified; parse from DB in production
                     closed_at: None,
                     security_score: row.get::<_, u32>(19).unwrap_or(0) as u8,
+                    age_secs: 0,
                 })
             })
             .context("Failed to query positions")?;

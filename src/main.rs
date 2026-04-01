@@ -23,6 +23,7 @@ use crate::risk::{CooldownManager, ListManager, RiskManager};
 use crate::telegram::TelegramBot;
 use crate::wallet::WalletManager;
 
+use crate::analyzer::entry_confirmation::{confirm_entry, EntryConfirmation, EntryDecision};
 use crate::analyzer::AnalyzerService;
 use crate::detector::DetectorService;
 use crate::executor::positions::PositionManager;
@@ -192,6 +193,29 @@ async fn main() -> Result<()> {
                                     "Score >= {} → AUTO BUY",
                                     analyzer_config.min_score_auto_buy
                                 );
+
+                                // Entry confirmation check
+                                match confirm_entry(&token, &analyzer_config.jupiter_api_url, &EntryConfirmation::default()).await {
+                                    Ok(EntryDecision::Proceed) => {
+                                        // Confirmed — continue to buy
+                                    }
+                                    Ok(EntryDecision::Reject(reason)) => {
+                                        warn!(
+                                            mint = %token.mint,
+                                            reason = %reason,
+                                            "Entry confirmation rejected, skipping buy"
+                                        );
+                                        continue;
+                                    }
+                                    Err(e) => {
+                                        warn!(
+                                            mint = %token.mint,
+                                            error = %e,
+                                            "Entry confirmation check failed, skipping buy"
+                                        );
+                                        continue;
+                                    }
+                                }
 
                                 // Get active wallet keypair
                                 match analyzer_wallet.get_active_wallet() {

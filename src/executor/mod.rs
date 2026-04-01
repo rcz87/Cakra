@@ -14,6 +14,7 @@ use std::sync::Arc;
 
 use anyhow::{Context, Result};
 use solana_client::rpc_client::RpcClient;
+use solana_sdk::pubkey::Pubkey;
 use solana_sdk::signer::keypair::Keypair;
 use solana_sdk::signer::Signer;
 use solana_sdk::transaction::Transaction;
@@ -188,9 +189,57 @@ impl ExecutorService {
             anyhow::bail!("Transaction not confirmed");
         }
 
-        // Track the new position
-        let entry_price = if route.expected_output > 0 {
-            amount_sol / (route.expected_output as f64)
+        // Query actual token balance received on-chain
+        let mint_pubkey: Pubkey = token.mint.parse()
+            .context("Failed to parse token mint pubkey")?;
+        let token_program: Pubkey = "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA".parse().unwrap();
+        let ata_program: Pubkey = "ATokenGPvbdGVxr1b2hvZbsiqW5xWH25efTNsLJA8knL".parse().unwrap();
+        let (ata, _) = Pubkey::find_program_address(
+            &[wallet.pubkey().as_ref(), token_program.as_ref(), mint_pubkey.as_ref()],
+            &ata_program,
+        );
+        let actual_output = {
+            let balance = self
+                .rpc
+                .get_token_account_balance(&ata)
+                .context("Failed to query token account balance after buy")?;
+            balance
+                .amount
+                .parse::<u64>()
+                .context("Failed to parse token balance amount")?
+        };
+
+        if actual_output == 0 {
+            anyhow::bail!(
+                "Post-buy balance is 0 for mint {} — transaction may have failed silently",
+                token.mint
+            );
+        }
+
+        // Validate slippage: compare expected vs actual output
+        let expected = route.expected_output;
+        if expected > 0 {
+            let slippage_pct = ((expected as f64 - actual_output as f64) / expected as f64) * 100.0;
+            info!(
+                expected = expected,
+                actual = actual_output,
+                slippage_pct = format!("{:.2}", slippage_pct),
+                "Post-execution slippage check"
+            );
+            if slippage_pct > 5.0 {
+                warn!(
+                    slippage_pct = format!("{:.2}", slippage_pct),
+                    expected = expected,
+                    actual = actual_output,
+                    mint = %token.mint,
+                    "High post-execution slippage detected (>{:.0}%)", 5.0
+                );
+            }
+        }
+
+        // Track the new position using actual on-chain output
+        let entry_price = if actual_output > 0 {
+            amount_sol / (actual_output as f64)
         } else {
             0.0
         };
@@ -201,15 +250,13 @@ impl ExecutorService {
             &wallet.pubkey().to_string(),
             entry_price,
             amount_sol,
-            route.expected_output as f64,
+            actual_output as f64,
             self.config.default_slippage_bps,
             &signature,
         )?;
 
         // Record trade for cooldown tracking
         self.cooldown.record_trade(&wallet.pubkey().to_string());
-
-        // TODO: validate_slippage post-transaction by comparing expected vs actual output on-chain
 
         Ok(signature)
     }

@@ -1,5 +1,8 @@
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
+use std::collections::VecDeque;
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 use tracing::info;
 
 /// Opportunity score factors and their weights.
@@ -117,36 +120,94 @@ pub fn calculate_opportunity_score(analysis: &OpportunityAnalysis) -> u8 {
     final_score
 }
 
+/// In-memory ring buffer that stores periodic SOL price samples
+/// and calculates the 1-hour trend.
+#[derive(Clone)]
+pub struct SolTrendTracker {
+    prices: Arc<Mutex<VecDeque<(Instant, f64)>>>,
+    max_samples: usize,
+}
+
+impl SolTrendTracker {
+    /// Create a new tracker with an empty buffer.
+    /// Default capacity is 120 samples (one per 30 seconds for 1 hour).
+    pub fn new() -> Self {
+        Self {
+            prices: Arc::new(Mutex::new(VecDeque::with_capacity(120))),
+            max_samples: 120,
+        }
+    }
+
+    /// Record a price sample, removing entries older than 1 hour.
+    pub fn record_price(&self, price: f64) {
+        let now = Instant::now();
+        let one_hour = Duration::from_secs(3600);
+        let mut buf = self.prices.lock().unwrap();
+
+        // Remove entries older than 1 hour
+        while let Some(&(ts, _)) = buf.front() {
+            if now.duration_since(ts) > one_hour {
+                buf.pop_front();
+            } else {
+                break;
+            }
+        }
+
+        // If we're at capacity, drop the oldest entry
+        if buf.len() >= self.max_samples {
+            buf.pop_front();
+        }
+
+        buf.push_back((now, price));
+    }
+
+    /// Compare the oldest sample to the newest and return the percentage change.
+    /// Returns 0.0 if fewer than 2 samples are available.
+    pub fn get_1h_change_pct(&self) -> f64 {
+        let buf = self.prices.lock().unwrap();
+        if buf.len() < 2 {
+            return 0.0;
+        }
+        let (_, oldest_price) = buf.front().unwrap();
+        let (_, newest_price) = buf.back().unwrap();
+        if *oldest_price == 0.0 {
+            return 0.0;
+        }
+        ((newest_price - oldest_price) / oldest_price) * 100.0
+    }
+
+    /// Fetch the current SOL price from Jupiter, record it, and return the price.
+    pub async fn fetch_and_record(&self) -> Result<f64> {
+        let http = reqwest::Client::new();
+
+        let resp = http
+            .get("https://price.jup.ag/v6/price?ids=SOL&vsToken=USDC")
+            .timeout(Duration::from_secs(5))
+            .send()
+            .await?;
+
+        #[derive(Deserialize)]
+        struct PriceResponse {
+            data: std::collections::HashMap<String, PriceData>,
+        }
+        #[derive(Deserialize)]
+        struct PriceData {
+            price: f64,
+        }
+
+        let price_resp: PriceResponse = resp.json().await?;
+        let current_price = price_resp.data.get("SOL").map(|d| d.price).unwrap_or(0.0);
+
+        self.record_price(current_price);
+        Ok(current_price)
+    }
+}
+
 /// Fetch SOL/USD price trend (1h change percentage).
-/// Uses CoinGecko free API or Jupiter price API.
-pub async fn get_sol_trend_1h() -> Result<f64> {
-    let http = reqwest::Client::new();
-
-    // Use Jupiter price API (free, no key needed)
-    let resp = http
-        .get("https://price.jup.ag/v6/price?ids=SOL&vsToken=USDC")
-        .timeout(std::time::Duration::from_secs(5))
-        .send()
-        .await?;
-
-    #[derive(Deserialize)]
-    struct PriceResponse {
-        data: std::collections::HashMap<String, PriceData>,
-    }
-    #[derive(Deserialize)]
-    struct PriceData {
-        price: f64,
-    }
-
-    let price_resp: PriceResponse = resp.json().await?;
-
-    // Jupiter price API doesn't give historical change directly.
-    // For a real implementation, you'd track prices over time or use CoinGecko.
-    // For now, return 0.0 (neutral) as a placeholder that will be improved.
-    // TODO: Implement real 1h price tracking by storing periodic SOL prices
-    let _current_price = price_resp.data.get("SOL").map(|d| d.price).unwrap_or(0.0);
-
-    Ok(0.0) // Placeholder — returns neutral until historical tracking is added
+/// Uses Jupiter price API and the provided tracker for historical samples.
+pub async fn get_sol_trend_1h(tracker: &SolTrendTracker) -> Result<f64> {
+    tracker.fetch_and_record().await?;
+    Ok(tracker.get_1h_change_pct())
 }
 
 #[cfg(test)]

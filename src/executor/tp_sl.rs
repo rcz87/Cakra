@@ -1,14 +1,31 @@
+use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::Result;
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, Mutex};
 use tracing::{error, info, warn};
 
 use crate::config::Config;
 use crate::models::Position;
 
 use super::positions::PositionManager;
+
+/// Graduated TP/SL tier for partial exits.
+#[derive(Debug, Clone)]
+pub struct TpSlTier {
+    pub trigger_pct: f64,   // PnL % that triggers this tier
+    pub sell_pct: u8,       // % of remaining position to sell
+}
+
+/// Default graduated TP tiers.
+pub fn default_tp_tiers() -> Vec<TpSlTier> {
+    vec![
+        TpSlTier { trigger_pct: 50.0, sell_pct: 50 },   // +50% → sell 50%
+        TpSlTier { trigger_pct: 100.0, sell_pct: 60 },  // +100% → sell 60% of remaining
+        TpSlTier { trigger_pct: 200.0, sell_pct: 100 },  // +200% → sell all remaining
+    ]
+}
 
 /// Commands sent from the TP/SL monitor to the executor for auto-selling.
 #[derive(Debug, Clone)]
@@ -31,6 +48,27 @@ pub enum TpSlCommand {
         symbol: String,
         drop_from_high_pct: f64,
     },
+    /// Trigger a partial take-profit at a tier.
+    PartialTakeProfit {
+        mint: String,
+        symbol: String,
+        pnl_pct: f64,
+        sell_pct: u8,
+        tier_index: usize,
+    },
+    /// Emergency exit due to liquidity removal.
+    EmergencyExit {
+        mint: String,
+        symbol: String,
+        reason: String,
+    },
+    /// Time stop — position has been open too long without sufficient profit.
+    TimeStop {
+        mint: String,
+        symbol: String,
+        age_secs: u64,
+        pnl_pct: f64,
+    },
 }
 
 /// Take-profit / stop-loss monitor that runs as a background tokio task.
@@ -42,6 +80,8 @@ pub struct TpSlMonitor {
     positions: PositionManager,
     command_tx: mpsc::Sender<TpSlCommand>,
     check_interval: Duration,
+    tp_tiers: Vec<TpSlTier>,
+    triggered_tiers: Arc<Mutex<HashMap<String, Vec<usize>>>>, // mint -> list of triggered tier indices
 }
 
 impl TpSlMonitor {
@@ -63,6 +103,8 @@ impl TpSlMonitor {
             positions,
             command_tx,
             check_interval: Duration::from_secs(check_interval_secs),
+            tp_tiers: default_tp_tiers(),
+            triggered_tiers: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 
@@ -138,29 +180,7 @@ impl TpSlMonitor {
 
     /// Evaluate a single position for TP/SL conditions.
     async fn evaluate_position(&self, pos: &Position) {
-        // Check take-profit
-        if pos.should_take_profit() {
-            info!(
-                mint = %pos.token_mint,
-                symbol = %pos.token_symbol,
-                pnl_pct = pos.pnl_pct,
-                tp_target = pos.take_profit_pct,
-                "Take-profit triggered"
-            );
-
-            let cmd = TpSlCommand::TakeProfit {
-                mint: pos.token_mint.clone(),
-                symbol: pos.token_symbol.clone(),
-                pnl_pct: pos.pnl_pct,
-            };
-
-            if let Err(e) = self.command_tx.send(cmd).await {
-                error!("Failed to send TP command: {e}");
-            }
-            return;
-        }
-
-        // Check stop-loss
+        // Check stop-loss first (highest priority)
         if pos.should_stop_loss() {
             warn!(
                 mint = %pos.token_mint,
@@ -182,8 +202,70 @@ impl TpSlMonitor {
             return;
         }
 
-        // Check trailing stop
-        if pos.should_trailing_stop() {
+        // Time stop: if position is open > 600 seconds (10 min) and PnL < 10%, exit
+        if pos.age_secs > 600 && pos.pnl_pct < 10.0 {
+            warn!(
+                mint = %pos.token_mint,
+                symbol = %pos.token_symbol,
+                age_secs = pos.age_secs,
+                pnl_pct = pos.pnl_pct,
+                "Time stop triggered — position stale"
+            );
+
+            let cmd = TpSlCommand::TimeStop {
+                mint: pos.token_mint.clone(),
+                symbol: pos.token_symbol.clone(),
+                age_secs: pos.age_secs,
+                pnl_pct: pos.pnl_pct,
+            };
+
+            if let Err(e) = self.command_tx.send(cmd).await {
+                error!("Failed to send time stop command: {e}");
+            }
+            return;
+        }
+
+        // Graduated TP: check tiers in order
+        {
+            let mut triggered = self.triggered_tiers.lock().await;
+            let triggered_for_mint = triggered.entry(pos.token_mint.clone()).or_default();
+
+            for (i, tier) in self.tp_tiers.iter().enumerate() {
+                if triggered_for_mint.contains(&i) {
+                    continue; // already triggered this tier
+                }
+                if pos.pnl_pct >= tier.trigger_pct {
+                    info!(
+                        mint = %pos.token_mint,
+                        symbol = %pos.token_symbol,
+                        pnl_pct = pos.pnl_pct,
+                        tier_index = i,
+                        trigger_pct = tier.trigger_pct,
+                        sell_pct = tier.sell_pct,
+                        "Graduated TP tier triggered"
+                    );
+
+                    triggered_for_mint.push(i);
+
+                    let cmd = TpSlCommand::PartialTakeProfit {
+                        mint: pos.token_mint.clone(),
+                        symbol: pos.token_symbol.clone(),
+                        pnl_pct: pos.pnl_pct,
+                        sell_pct: tier.sell_pct,
+                        tier_index: i,
+                    };
+
+                    if let Err(e) = self.command_tx.send(cmd).await {
+                        error!("Failed to send partial TP command: {e}");
+                    }
+                    // Only trigger one tier per evaluation cycle
+                    return;
+                }
+            }
+        }
+
+        // Trailing stop: only activates after PnL > 30%
+        if pos.pnl_pct > 30.0 && pos.should_trailing_stop() {
             let drop_from_high = if pos.highest_price_sol > 0.0 {
                 ((pos.highest_price_sol - pos.current_price_sol) / pos.highest_price_sol) * 100.0
             } else {
@@ -196,7 +278,7 @@ impl TpSlMonitor {
                 drop_pct = drop_from_high,
                 highest = pos.highest_price_sol,
                 current = pos.current_price_sol,
-                "Trailing stop triggered"
+                "Trailing stop triggered (after 30% profit gate)"
             );
 
             let cmd = TpSlCommand::TrailingStop {
@@ -207,6 +289,28 @@ impl TpSlMonitor {
 
             if let Err(e) = self.command_tx.send(cmd).await {
                 error!("Failed to send trailing stop command: {e}");
+            }
+            return;
+        }
+
+        // Check classic take-profit (full exit at configured TP level)
+        if pos.should_take_profit() {
+            info!(
+                mint = %pos.token_mint,
+                symbol = %pos.token_symbol,
+                pnl_pct = pos.pnl_pct,
+                tp_target = pos.take_profit_pct,
+                "Take-profit triggered"
+            );
+
+            let cmd = TpSlCommand::TakeProfit {
+                mint: pos.token_mint.clone(),
+                symbol: pos.token_symbol.clone(),
+                pnl_pct: pos.pnl_pct,
+            };
+
+            if let Err(e) = self.command_tx.send(cmd).await {
+                error!("Failed to send TP command: {e}");
             }
         }
     }
@@ -250,6 +354,39 @@ pub async fn process_tp_sl_commands(
                 );
                 if let Err(e) = sell_tx.send((mint, 100)).await {
                     error!("Failed to dispatch trailing stop sell: {e}");
+                }
+            }
+            TpSlCommand::PartialTakeProfit { mint, symbol, pnl_pct, sell_pct, tier_index } => {
+                info!(
+                    symbol = %symbol,
+                    pnl_pct = pnl_pct,
+                    sell_pct = sell_pct,
+                    tier = tier_index,
+                    "Processing graduated TP: partial sell"
+                );
+                if let Err(e) = sell_tx.send((mint, sell_pct)).await {
+                    error!("Failed to dispatch partial TP sell: {e}");
+                }
+            }
+            TpSlCommand::EmergencyExit { mint, symbol, reason } => {
+                error!(
+                    symbol = %symbol,
+                    reason = %reason,
+                    "Processing emergency exit: selling 100%"
+                );
+                if let Err(e) = sell_tx.send((mint, 100)).await {
+                    error!("Failed to dispatch emergency exit sell: {e}");
+                }
+            }
+            TpSlCommand::TimeStop { mint, symbol, age_secs, pnl_pct } => {
+                warn!(
+                    symbol = %symbol,
+                    age_secs = age_secs,
+                    pnl_pct = pnl_pct,
+                    "Processing time stop: selling 100%"
+                );
+                if let Err(e) = sell_tx.send((mint, 100)).await {
+                    error!("Failed to dispatch time stop sell: {e}");
                 }
             }
         }

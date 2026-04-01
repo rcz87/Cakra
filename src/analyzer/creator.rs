@@ -1,11 +1,47 @@
 use anyhow::{Context, Result};
+use solana_client::rpc_client::GetConfirmedSignaturesForAddress2Config;
 use solana_client::rpc_client::RpcClient;
 use solana_sdk::pubkey::Pubkey;
 use solana_sdk::signature::Signature;
+use std::collections::HashMap;
 use std::str::FromStr;
+use std::sync::Mutex;
+use std::time::{Duration, Instant};
 use tracing::{info, warn};
 
 use crate::models::token::CreatorHistory;
+
+/// In-memory cache for creator analysis results with a configurable TTL.
+pub struct CreatorCache {
+    cache: Mutex<HashMap<String, (CreatorHistory, Instant)>>,
+    ttl: Duration,
+}
+
+impl CreatorCache {
+    pub fn new(ttl_secs: u64) -> Self {
+        Self {
+            cache: Mutex::new(HashMap::new()),
+            ttl: Duration::from_secs(ttl_secs),
+        }
+    }
+
+    /// Return a cached `CreatorHistory` if present and not expired.
+    pub fn get(&self, creator: &str) -> Option<CreatorHistory> {
+        let map = self.cache.lock().expect("CreatorCache lock poisoned");
+        if let Some((history, inserted_at)) = map.get(creator) {
+            if inserted_at.elapsed() < self.ttl {
+                return Some(history.clone());
+            }
+        }
+        None
+    }
+
+    /// Store a `CreatorHistory` in the cache.
+    pub fn set(&self, creator: &str, history: CreatorHistory) {
+        let mut map = self.cache.lock().expect("CreatorCache lock poisoned");
+        map.insert(creator.to_string(), (history, Instant::now()));
+    }
+}
 
 /// The SPL Token program ID.
 const TOKEN_PROGRAM_ID: &str = "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA";
@@ -18,13 +54,25 @@ const QUICK_REMOVE_SLOT_WINDOW: u64 = 1000;
 
 /// Analyze the history of a creator wallet to determine if they have a pattern
 /// of creating tokens and quickly removing liquidity (rug-pulling).
-pub fn analyze_creator(rpc: &RpcClient, creator: &str) -> Result<CreatorHistory> {
+pub async fn analyze_creator(rpc: &RpcClient, creator: &str, cache: &CreatorCache) -> Result<CreatorHistory> {
+    // Check cache first
+    if let Some(cached) = cache.get(creator) {
+        info!(creator = %creator, "Using cached creator analysis");
+        return Ok(cached);
+    }
+
     let creator_pubkey =
         Pubkey::from_str(creator).context("Invalid creator public key")?;
 
-    // Fetch recent transaction signatures for the creator wallet.
+    // Fetch recent transaction signatures for the creator wallet (limited to 20).
     let signatures = rpc
-        .get_signatures_for_address(&creator_pubkey)
+        .get_signatures_for_address_with_config(
+            &creator_pubkey,
+            GetConfirmedSignaturesForAddress2Config {
+                limit: Some(20),
+                ..Default::default()
+            },
+        )
         .context("Failed to fetch creator transaction history")?;
 
     if signatures.is_empty() {
@@ -109,6 +157,9 @@ pub fn analyze_creator(rpc: &RpcClient, creator: &str) -> Result<CreatorHistory>
         suspected_rugs,
         "Creator analysis complete"
     );
+
+    // Store in cache for future lookups
+    cache.set(creator, history.clone());
 
     Ok(history)
 }

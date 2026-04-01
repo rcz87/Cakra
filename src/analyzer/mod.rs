@@ -1,9 +1,11 @@
 pub mod authority;
 pub mod creator;
+pub mod entry_confirmation;
 pub mod goplus;
 pub mod honeypot;
 pub mod liquidity;
 pub mod metadata;
+pub mod opportunity;
 pub mod rugcheck;
 pub mod scoring;
 pub mod socials;
@@ -98,10 +100,11 @@ impl AnalyzerService {
 
         // --- Honeypot simulation ---
         match simulate_honeypot(
-            rpc_client,
+            &self.config.jupiter_api_url,
             &token.mint,
-            token.pool_address.as_deref(),
-        ) {
+        )
+        .await
+        {
             Ok(result) => {
                 analysis.honeypot_result = result;
                 info!(mint = %token.mint, "Honeypot simulation complete");

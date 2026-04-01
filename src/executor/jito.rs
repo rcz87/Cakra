@@ -10,6 +10,23 @@ use solana_sdk::{
 };
 use tracing::{error, info, warn};
 
+#[derive(Debug, Deserialize)]
+struct BundleStatusResponse {
+    result: Option<BundleStatusResult>,
+}
+
+#[derive(Debug, Deserialize)]
+struct BundleStatusResult {
+    value: Vec<BundleStatusEntry>,
+}
+
+#[derive(Debug, Deserialize)]
+struct BundleStatusEntry {
+    bundle_id: String,
+    status: String,
+    landed_slot: Option<u64>,
+}
+
 /// Known Jito tip payment accounts.
 const JITO_TIP_ACCOUNTS: &[&str] = &[
     "96gYZGLnJYVFmbjzopPSU6QiEV5fGqZNyN9nmNhvrZU5",
@@ -171,5 +188,52 @@ impl JitoClient {
 
         let body = response.text().await?;
         Ok(body)
+    }
+
+    /// Poll for bundle confirmation up to `timeout_secs` seconds.
+    /// Returns `true` if the bundle landed/finalized, `false` otherwise.
+    pub async fn confirm_bundle(&self, bundle_id: &str, timeout_secs: u64) -> Result<bool> {
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(timeout_secs);
+
+        loop {
+            if tokio::time::Instant::now() >= deadline {
+                warn!(bundle_id = %bundle_id, "Bundle confirmation timed out");
+                return Ok(false);
+            }
+
+            let raw = self.get_bundle_status(bundle_id).await?;
+            if let Ok(parsed) = serde_json::from_str::<BundleStatusResponse>(&raw) {
+                if let Some(result) = parsed.result {
+                    for entry in &result.value {
+                        if entry.bundle_id == bundle_id {
+                            match entry.status.as_str() {
+                                "Landed" | "Finalized" => {
+                                    info!(
+                                        bundle_id = %bundle_id,
+                                        status = %entry.status,
+                                        landed_slot = ?entry.landed_slot,
+                                        "Bundle confirmed"
+                                    );
+                                    return Ok(true);
+                                }
+                                "Failed" | "Invalid" => {
+                                    warn!(
+                                        bundle_id = %bundle_id,
+                                        status = %entry.status,
+                                        "Bundle failed"
+                                    );
+                                    return Ok(false);
+                                }
+                                _ => {
+                                    // Still pending, continue polling
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+
+            tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+        }
     }
 }

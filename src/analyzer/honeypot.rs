@@ -1,13 +1,5 @@
 use anyhow::{Context, Result};
-use solana_client::rpc_client::RpcClient;
-use solana_sdk::{
-    commitment_config::CommitmentConfig,
-    instruction::{AccountMeta, Instruction},
-    message::Message,
-    pubkey::Pubkey,
-    transaction::Transaction,
-};
-use std::str::FromStr;
+use serde::Deserialize;
 use tracing::{info, warn};
 
 use crate::models::token::HoneypotResult;
@@ -15,117 +7,139 @@ use crate::models::token::HoneypotResult;
 /// Native SOL mint (wrapped SOL).
 const WSOL_MINT: &str = "So11111111111111111111111111111111111111112";
 
-/// Raydium AMM program ID.
-const RAYDIUM_AMM_PROGRAM: &str = "675kPX9MHTjS2zt1qfr1NYHuzeLXfQM9H24wFSUt1Mp8";
-
 /// Simulated swap amount in lamports (0.001 SOL for testing).
 const SIM_AMOUNT_LAMPORTS: u64 = 1_000_000;
 
 /// Tax threshold above which we classify as "high tax" (percent).
 const HIGH_TAX_THRESHOLD: f64 = 10.0;
 
-/// Simulate a buy and sell transaction to detect honeypot behaviour.
+/// Minimal Jupiter quote response for honeypot detection.
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct JupiterQuote {
+    in_amount: String,
+    out_amount: String,
+}
+
+/// Simulate a buy and sell via Jupiter quotes to detect honeypot behaviour.
 ///
-/// Uses the `simulateTransaction` RPC method to test whether a sell would
-/// revert after a successful buy. Also estimates buy/sell tax from the
-/// simulated output amounts.
-pub fn simulate_honeypot(
-    rpc: &RpcClient,
+/// 1. Gets a buy quote (SOL → token) for 0.001 SOL.
+/// 2. Gets a sell quote (token → SOL) using the output from step 1.
+/// 3. If the buy quote fails, the token might be a honeypot or unlisted.
+/// 4. If the sell quote fails, the token is a confirmed honeypot.
+/// 5. Compares sell output to buy input to estimate buy_tax and sell_tax.
+pub async fn simulate_honeypot(
+    jupiter_api_url: &str,
     mint: &str,
-    pool_address: Option<&str>,
 ) -> Result<HoneypotResult> {
-    let pool_addr = match pool_address {
-        Some(p) => p,
-        None => {
-            warn!(mint = %mint, "No pool address provided, skipping honeypot simulation");
+    let base_url = jupiter_api_url.trim_end_matches('/');
+    let http = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(10))
+        .build()
+        .context("Failed to build HTTP client")?;
+
+    // --- Step 1: Buy quote (SOL -> Token) ---
+    let buy_url = format!(
+        "{}/quote?inputMint={}&outputMint={}&amount={}&slippageBps=500&onlyDirectRoutes=false",
+        base_url, WSOL_MINT, mint, SIM_AMOUNT_LAMPORTS,
+    );
+
+    let buy_resp = http.get(&buy_url).send().await;
+    let buy_quote: JupiterQuote = match buy_resp {
+        Ok(resp) if resp.status().is_success() => {
+            match resp.json::<JupiterQuote>().await {
+                Ok(q) => q,
+                Err(e) => {
+                    warn!(mint = %mint, err = %e, "Failed to parse buy quote — token may be unlisted");
+                    return Ok(HoneypotResult::Unknown);
+                }
+            }
+        }
+        Ok(resp) => {
+            warn!(
+                mint = %mint,
+                status = %resp.status(),
+                "Buy quote returned non-success — token may be honeypot or unlisted"
+            );
+            return Ok(HoneypotResult::Honeypot);
+        }
+        Err(e) => {
+            warn!(mint = %mint, err = %e, "Buy quote request failed");
             return Ok(HoneypotResult::Unknown);
         }
     };
 
-    let mint_pubkey = Pubkey::from_str(mint).context("Invalid mint pubkey")?;
-    let pool_pubkey = Pubkey::from_str(pool_addr).context("Invalid pool pubkey")?;
-    let wsol_pubkey = Pubkey::from_str(WSOL_MINT).context("Invalid WSOL pubkey")?;
-    let amm_program = Pubkey::from_str(RAYDIUM_AMM_PROGRAM).context("Invalid AMM program ID")?;
+    let tokens_received: u64 = buy_quote
+        .out_amount
+        .parse()
+        .context("Failed to parse buy quote out_amount")?;
 
-    // Build a minimal swap instruction (buy: SOL -> Token).
-    let buy_ix = build_swap_instruction(
-        &amm_program,
-        &pool_pubkey,
-        &wsol_pubkey,
-        &mint_pubkey,
-        SIM_AMOUNT_LAMPORTS,
-    );
-
-    // Use a dummy payer for simulation (the transaction will not be submitted).
-    let dummy_payer = Pubkey::new_unique();
-
-    // --- Simulate BUY ---
-    let buy_msg = Message::new(&[buy_ix], Some(&dummy_payer));
-    let buy_tx = Transaction::new_unsigned(buy_msg);
-
-    let buy_sim = rpc.simulate_transaction(&buy_tx).context("Buy simulation RPC call failed")?;
-
-    if let Some(ref err) = buy_sim.value.err {
-        warn!(mint = %mint, error = ?err, "Buy simulation reverted — possible honeypot");
+    if tokens_received == 0 {
+        warn!(mint = %mint, "Buy quote returned 0 tokens — possible honeypot");
         return Ok(HoneypotResult::Honeypot);
     }
 
-    // Estimate tokens received from buy (from simulation logs).
-    let buy_output = parse_swap_output_from_logs(&buy_sim.value.logs.unwrap_or_default());
-
-    // --- Simulate SELL ---
-    let sell_amount = buy_output.unwrap_or(SIM_AMOUNT_LAMPORTS);
-    let sell_ix = build_swap_instruction(
-        &amm_program,
-        &pool_pubkey,
-        &mint_pubkey,
-        &wsol_pubkey,
-        sell_amount,
+    // --- Step 2: Sell quote (Token -> SOL) ---
+    let sell_url = format!(
+        "{}/quote?inputMint={}&outputMint={}&amount={}&slippageBps=500&onlyDirectRoutes=false",
+        base_url, mint, WSOL_MINT, tokens_received,
     );
 
-    let sell_msg = Message::new(&[sell_ix], Some(&dummy_payer));
-    let sell_tx = Transaction::new_unsigned(sell_msg);
-
-    let sell_sim = rpc
-        .simulate_transaction(&sell_tx)
-        .context("Sell simulation RPC call failed")?;
-
-    if let Some(ref err) = sell_sim.value.err {
-        warn!(mint = %mint, error = ?err, "Sell simulation reverted — HONEYPOT detected");
-        return Ok(HoneypotResult::Honeypot);
-    }
-
-    let sell_output = parse_swap_output_from_logs(&sell_sim.value.logs.unwrap_or_default());
-
-    // --- Compute taxes ---
-    let buy_tax = if let Some(tokens_out) = buy_output {
-        let expected = SIM_AMOUNT_LAMPORTS as f64;
-        let actual = tokens_out as f64;
-        if expected > 0.0 {
-            ((expected - actual) / expected * 100.0).max(0.0)
-        } else {
-            0.0
+    let sell_resp = http.get(&sell_url).send().await;
+    let sell_quote: JupiterQuote = match sell_resp {
+        Ok(resp) if resp.status().is_success() => {
+            match resp.json::<JupiterQuote>().await {
+                Ok(q) => q,
+                Err(e) => {
+                    warn!(mint = %mint, err = %e, "Failed to parse sell quote — HONEYPOT detected");
+                    return Ok(HoneypotResult::Honeypot);
+                }
+            }
         }
+        Ok(resp) => {
+            warn!(
+                mint = %mint,
+                status = %resp.status(),
+                "Sell quote returned non-success — HONEYPOT detected"
+            );
+            return Ok(HoneypotResult::Honeypot);
+        }
+        Err(e) => {
+            warn!(mint = %mint, err = %e, "Sell quote request failed — HONEYPOT detected");
+            return Ok(HoneypotResult::Honeypot);
+        }
+    };
+
+    let sol_returned: u64 = sell_quote
+        .out_amount
+        .parse()
+        .context("Failed to parse sell quote out_amount")?;
+
+    // --- Step 3: Compute taxes ---
+    let buy_input = SIM_AMOUNT_LAMPORTS as f64;
+    let buy_output_sol_value = sol_returned as f64; // what we'd get back
+    // Buy tax: how much value is lost on the buy side.
+    // If no tax, selling immediately should return ~SIM_AMOUNT_LAMPORTS (minus AMM fees).
+    // We compare the round-trip to estimate combined tax, then split it.
+    let round_trip_loss_pct = if buy_input > 0.0 {
+        ((buy_input - buy_output_sol_value) / buy_input * 100.0).max(0.0)
     } else {
         0.0
     };
 
-    let sell_tax = if let (Some(tokens_in), Some(sol_out)) = (buy_output, sell_output) {
-        let expected = tokens_in as f64;
-        let actual = sol_out as f64;
-        if expected > 0.0 {
-            ((expected - actual) / expected * 100.0).max(0.0)
-        } else {
-            0.0
-        }
-    } else {
-        0.0
-    };
+    // Approximate: split round-trip loss evenly as buy_tax and sell_tax.
+    // A more accurate split would require a no-tax baseline, but for honeypot
+    // detection the total loss is what matters.
+    let buy_tax = round_trip_loss_pct / 2.0;
+    let sell_tax = round_trip_loss_pct / 2.0;
 
     info!(
         mint = %mint,
+        tokens_received,
+        sol_returned,
         buy_tax,
         sell_tax,
+        round_trip_loss_pct,
         "Honeypot simulation complete"
     );
 
@@ -134,57 +148,4 @@ pub fn simulate_honeypot(
     } else {
         Ok(HoneypotResult::Safe { buy_tax, sell_tax })
     }
-}
-
-/// Build a minimal Raydium-style swap instruction for simulation purposes.
-fn build_swap_instruction(
-    program_id: &Pubkey,
-    pool: &Pubkey,
-    source_mint: &Pubkey,
-    dest_mint: &Pubkey,
-    amount_in: u64,
-) -> Instruction {
-    // Instruction data: swap discriminator (9) + amount_in + min_out (0 for sim)
-    let mut data = Vec::with_capacity(17);
-    data.push(9u8); // swap instruction index
-    data.extend_from_slice(&amount_in.to_le_bytes());
-    data.extend_from_slice(&0u64.to_le_bytes()); // minimum amount out
-
-    Instruction {
-        program_id: *program_id,
-        accounts: vec![
-            AccountMeta::new(*pool, false),
-            AccountMeta::new_readonly(*source_mint, false),
-            AccountMeta::new_readonly(*dest_mint, false),
-        ],
-        data,
-    }
-}
-
-/// Attempt to parse the output amount from simulation log messages.
-/// Looks for a pattern like "amount_out: <number>" in the program logs.
-fn parse_swap_output_from_logs(logs: &[String]) -> Option<u64> {
-    for log in logs {
-        // Common Raydium log format
-        if let Some(idx) = log.find("amount_out:") {
-            let after = &log[idx + 11..];
-            let trimmed = after.trim();
-            if let Some(num_str) = trimmed.split_whitespace().next() {
-                if let Ok(val) = num_str.parse::<u64>() {
-                    return Some(val);
-                }
-            }
-        }
-        // Alternative: look for "output_amount" or similar
-        if let Some(idx) = log.find("output_amount") {
-            let after = &log[idx + 13..];
-            let trimmed = after.trim().trim_start_matches([':', '=', ' ']);
-            if let Some(num_str) = trimmed.split_whitespace().next() {
-                if let Ok(val) = num_str.parse::<u64>() {
-                    return Some(val);
-                }
-            }
-        }
-    }
-    None
 }

@@ -84,9 +84,10 @@ async fn main() -> Result<()> {
     }
 
     // ── Wallet Manager (shared for buy/sell) ─────────────────────
-    let wallet_password = std::env::var("WALLET_PASSWORD").unwrap_or_default();
-    if wallet_password.is_empty() {
-        warn!("WALLET_PASSWORD is not set — wallet operations will fail. Set it in .env or environment.");
+    let wallet_password = std::env::var("WALLET_PASSWORD")
+        .expect("WALLET_PASSWORD must be set — cannot start without wallet encryption password");
+    if wallet_password.len() < 8 {
+        panic!("WALLET_PASSWORD must be at least 8 characters for wallet security");
     }
     let wallet_manager = Arc::new(
         WalletManager::new(&config, db.clone()).expect("Failed to create wallet manager"),
@@ -98,6 +99,7 @@ async fn main() -> Result<()> {
         RiskManager::new(config.clone(), db.clone()),
         CooldownManager::new(config.trade_cooldown_secs),
         ListManager::new(db.clone()),
+        position_manager.clone(),
     ));
 
     // ── Channel: Detector → Analyzer ───────────────────────────

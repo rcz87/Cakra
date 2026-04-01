@@ -117,9 +117,15 @@ async fn process_raw_transactions(
                     "New token detected"
                 );
 
-                if let Err(e) = token_sender.send(info).await {
-                    error!(error = %e, "Failed to send detected token to channel");
-                    break;
+                match token_sender.try_send(info) {
+                    Ok(()) => {}
+                    Err(mpsc::error::TrySendError::Full(_)) => {
+                        warn!("Token channel full — dropping token, analyzer may be overloaded");
+                    }
+                    Err(mpsc::error::TrySendError::Closed(_)) => {
+                        error!("Token channel closed — analyzer has shut down");
+                        break;
+                    }
                 }
             }
         }

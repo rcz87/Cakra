@@ -82,7 +82,7 @@ impl Config {
             jupiter_api_key: env::var("JUPITER_API_KEY").unwrap_or_default(),
 
             encryption_salt: env::var("ENCRYPTION_SALT")
-                .unwrap_or_else(|_| "default-salt-change-me".to_string()),
+                .context("ENCRYPTION_SALT must be set — generate with: openssl rand -base64 32")?,
 
             database_path: env::var("DATABASE_PATH")
                 .unwrap_or_else(|_| "data/ricoz-sniper.db".to_string()),

@@ -605,6 +605,19 @@ async fn main() -> Result<()> {
                             signature = %sig,
                             "Sell executed successfully"
                         );
+
+                        let _ = sell_tg_bot.send_message(
+                            sell_tg_chat,
+                            format!(
+                                "\u{1f4b0} <b>AUTO SELL Executed</b>\n\
+                                 \u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\n\n\
+                                 \u{1f4e6} <b>Mint:</b> <code>{}</code>\n\
+                                 \u{1f4ca} <b>Sell:</b> {}%\n\
+                                 \u{1f4dd} <b>Tx:</b> <code>{}</code>",
+                                mint, sell_pct, sig
+                            ),
+                        ).parse_mode(teloxide::types::ParseMode::Html).await;
+
                         sell_ok = true;
                         break;
                     }

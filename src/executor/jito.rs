@@ -109,6 +109,13 @@ pub struct JitoClient {
 
 impl JitoClient {
     pub fn new(endpoint: &str) -> Self {
+        if !endpoint.starts_with("https://") {
+            panic!(
+                "Jito endpoint must use HTTPS (got: '{}').\n\
+                 Using HTTP exposes bundle data to network eavesdropping.",
+                endpoint
+            );
+        }
         Self {
             endpoint: format!("{}/api/v1/bundles", endpoint.trim_end_matches('/')),
             http: reqwest::Client::builder()

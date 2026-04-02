@@ -76,8 +76,21 @@ async fn main() -> Result<()> {
     // ── Shutdown signal channel ────────────────────────────────
     let (shutdown_tx, _) = broadcast::channel::<()>(1);
 
+    // ── Trading profile from mode ────────────────────────────
+    let trading_profile = config.trading_profile();
+    info!(
+        mode = %trading_profile.mode,
+        tp = trading_profile.take_profit_pct,
+        sl = trading_profile.stop_loss_pct,
+        trailing = trading_profile.trailing_stop_pct,
+        time_stop = trading_profile.time_stop_secs,
+        max_hold = trading_profile.max_hold_secs,
+        price_poll = trading_profile.price_poll_secs,
+        "Trading profile loaded"
+    );
+
     // ── Create shared components ───────────────────────────────
-    let position_manager = PositionManager::new(db.clone());
+    let position_manager = PositionManager::new(db.clone(), trading_profile.clone());
 
     // Load any persisted open positions from previous session
     if let Err(e) = position_manager.load_from_db() {
@@ -430,7 +443,12 @@ async fn main() -> Result<()> {
     let price_rpc = Arc::new(solana_client::rpc_client::RpcClient::new(
         config.effective_rpc_url().to_string(),
     ));
-    let price_feed = PriceFeed::new(&config.jupiter_api_url, &config.jupiter_api_key, 3, price_rpc);
+    let price_feed = PriceFeed::new(
+        &config.jupiter_api_url,
+        &config.jupiter_api_key,
+        trading_profile.price_poll_secs,
+        price_rpc,
+    );
     let price_positions = position_manager.clone();
     let mut price_shutdown = shutdown_tx.subscribe();
     let price_handle = tokio::spawn(async move {
@@ -451,7 +469,6 @@ async fn main() -> Result<()> {
     let (tpsl_monitor, tpsl_command_rx) = TpSlMonitor::create(
         Arc::new(config.clone()),
         position_manager.clone(),
-        3, // check every 3 seconds
     );
     let mut tpsl_shutdown = shutdown_tx.subscribe();
     let tpsl_handle = tokio::spawn(async move {

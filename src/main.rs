@@ -76,8 +76,21 @@ async fn main() -> Result<()> {
     // ── Shutdown signal channel ────────────────────────────────
     let (shutdown_tx, _) = broadcast::channel::<()>(1);
 
+    // ── Trading profile from mode ────────────────────────────
+    let trading_profile = config.trading_profile();
+    info!(
+        mode = %trading_profile.mode,
+        tp = trading_profile.take_profit_pct,
+        sl = trading_profile.stop_loss_pct,
+        trailing = trading_profile.trailing_stop_pct,
+        time_stop = trading_profile.time_stop_secs,
+        max_hold = trading_profile.max_hold_secs,
+        price_poll = trading_profile.price_poll_secs,
+        "Trading profile loaded"
+    );
+
     // ── Create shared components ───────────────────────────────
-    let position_manager = PositionManager::new(db.clone());
+    let position_manager = PositionManager::new(db.clone(), trading_profile.clone());
 
     // Load any persisted open positions from previous session
     if let Err(e) = position_manager.load_from_db() {
@@ -93,6 +106,38 @@ async fn main() -> Result<()> {
     let wallet_manager = Arc::new(
         WalletManager::new(&config, db.clone()).expect("Failed to create wallet manager"),
     );
+
+    // ── Verify wallet decrypt works BEFORE starting trading ───────
+    match wallet_manager.get_active_wallet() {
+        Ok(Some(active)) => {
+            match wallet_manager.get_keypair(&active.pubkey, &wallet_password) {
+                Ok(_kp) => {
+                    info!(
+                        pubkey = %active.pubkey,
+                        "Wallet decrypt verified — sell will work"
+                    );
+                }
+                Err(e) => {
+                    panic!(
+                        "FATAL: Active wallet '{}' cannot be decrypted: {}. \
+                         Bot CANNOT sell positions. Fix WALLET_PASSWORD before starting.",
+                        active.pubkey, e
+                    );
+                }
+            }
+        }
+        Ok(None) => {
+            warn!(
+                "No active wallet set. Bot will detect and analyze tokens, \
+                 but CANNOT buy or sell until a wallet is activated via /wallet."
+            );
+        }
+        Err(e) => {
+            panic!(
+                "FATAL: Cannot query wallets: {}. Fix database before starting.", e
+            );
+        }
+    }
 
     let executor = Arc::new(ExecutorService::new(
         Arc::new(config.clone()),
@@ -149,9 +194,46 @@ async fn main() -> Result<()> {
         let tg_bot = teloxide::Bot::new(&analyzer_config.telegram_bot_token);
         let tg_chat = teloxide::types::ChatId(analyzer_config.telegram_admin_chat_id);
 
+        // Circuit breaker: track analyzer errors within a rolling window.
+        // If errors exceed the threshold, pause processing and alert.
+        const CB_ERROR_THRESHOLD: u32 = 5;
+        const CB_WINDOW: std::time::Duration = std::time::Duration::from_secs(60);
+        const CB_PAUSE: std::time::Duration = std::time::Duration::from_secs(30);
+
+        let mut error_timestamps: Vec<tokio::time::Instant> = Vec::new();
+
         loop {
             tokio::select! {
                 Some(token) = token_rx.recv() => {
+                    // ── Circuit breaker check ──────────────────────────────
+                    let now = tokio::time::Instant::now();
+                    error_timestamps.retain(|t| now.duration_since(*t) < CB_WINDOW);
+
+                    if error_timestamps.len() >= CB_ERROR_THRESHOLD as usize {
+                        warn!(
+                            errors_in_window = error_timestamps.len(),
+                            pause_secs = CB_PAUSE.as_secs(),
+                            "Circuit breaker OPEN — too many analyzer errors, pausing processing"
+                        );
+                        let _ = tg_bot.send_message(
+                            tg_chat,
+                            format!(
+                                "\u{1f6a8} <b>Circuit Breaker Triggered</b>\n\n\
+                                 \u{26a0}\u{fe0f} {} analyzer errors in {}s window.\n\
+                                 \u{23f8}\u{fe0f} Pausing token processing for {}s.\n\n\
+                                 <i>Bot will auto-resume. Check RPC/network health.</i>",
+                                error_timestamps.len(),
+                                CB_WINDOW.as_secs(),
+                                CB_PAUSE.as_secs(),
+                            ),
+                        ).parse_mode(teloxide::types::ParseMode::Html).await;
+
+                        tokio::time::sleep(CB_PAUSE).await;
+                        error_timestamps.clear();
+                        info!("Circuit breaker CLOSED — resuming token processing");
+                        continue;
+                    }
+
                     info!(
                         mint = %token.mint,
                         symbol = %token.symbol,
@@ -176,8 +258,13 @@ async fn main() -> Result<()> {
                         warn!(error = %e, "Failed to store token in database");
                     }
 
-                    // Run security analysis
-                    match analyzer.analyze_token(&token, &rpc).await {
+                    // Run security analysis (fast filter for snipe mode, full for others)
+                    let analysis_result = if analyzer_config.trading_mode == crate::config::TradingMode::Snipe {
+                        analyzer.analyze_token_fast(&token, &rpc).await
+                    } else {
+                        analyzer.analyze_token(&token, &rpc).await
+                    };
+                    match analysis_result {
                         Ok(analysis) => {
                             let score = analysis.final_score;
                             info!(
@@ -196,8 +283,39 @@ async fn main() -> Result<()> {
                                 );
                             }
 
+                            // Compute opportunity score (basic: uses available data)
+                            let opp_analysis = crate::analyzer::opportunity::OpportunityAnalysis {
+                                buy_count: 0,             // TODO: track from gRPC stream
+                                unique_buyers: 0,         // TODO: track from gRPC stream
+                                seconds_since_creation: token.detected_at
+                                    .signed_duration_since(chrono::Utc::now())
+                                    .num_seconds()
+                                    .unsigned_abs(),
+                                liquidity_usd: if token.initial_liquidity_usd > 0.0 {
+                                    token.initial_liquidity_usd
+                                } else {
+                                    token.initial_liquidity_sol * 100.0 // conservative
+                                },
+                                price_change_pct: 0.0,    // TODO: track price delta
+                                sol_trend_1h_pct: 0.0,    // TODO: wire SolTrendTracker
+                                largest_buyer_pct: 0.0,   // TODO: track from gRPC
+                                opportunity_score: 0,
+                            };
+                            let opp_score = crate::analyzer::opportunity::calculate_opportunity_score(&opp_analysis);
+
+                            // Combined score: 60% security + 40% opportunity
+                            let combined_score = ((score as f64 * 0.6) + (opp_score as f64 * 0.4)).round() as u8;
+
+                            info!(
+                                mint = %token.mint,
+                                security_score = score,
+                                opportunity_score = opp_score,
+                                combined_score = combined_score,
+                                "Combined scoring complete"
+                            );
+
                             // Decision: Auto buy, notify, or skip
-                            if score >= analyzer_config.min_score_auto_buy {
+                            if combined_score >= analyzer_config.min_score_auto_buy {
                                 info!(
                                     mint = %token.mint,
                                     score = score,
@@ -205,8 +323,13 @@ async fn main() -> Result<()> {
                                     analyzer_config.min_score_auto_buy
                                 );
 
-                                // Entry confirmation check
-                                match confirm_entry(&token, &analyzer_config.jupiter_api_url, &EntryConfirmation::default()).await {
+                                // Entry confirmation check (skip delay for snipe mode)
+                                let entry_conf = if analyzer_config.trading_mode == crate::config::TradingMode::Snipe {
+                                    EntryConfirmation { delay_secs: 0, ..EntryConfirmation::default() }
+                                } else {
+                                    EntryConfirmation::default()
+                                };
+                                match confirm_entry(&token, &analyzer_config.jupiter_api_url, &entry_conf).await {
                                     Ok(EntryDecision::Proceed) => {
                                         // Confirmed — continue to buy
                                     }
@@ -296,6 +419,7 @@ async fn main() -> Result<()> {
                                                             error = %e,
                                                             "AUTO BUY failed"
                                                         );
+                                                        error_timestamps.push(tokio::time::Instant::now());
 
                                                         let _ = tg_bot.send_message(
                                                             tg_chat,
@@ -327,7 +451,7 @@ async fn main() -> Result<()> {
                                         error!(error = %e, "Failed to get active wallet");
                                     }
                                 }
-                            } else if score >= analyzer_config.min_score_notify {
+                            } else if combined_score >= analyzer_config.min_score_notify {
                                 info!(
                                     mint = %token.mint,
                                     score = score,
@@ -364,8 +488,10 @@ async fn main() -> Result<()> {
                             } else {
                                 info!(
                                     mint = %token.mint,
-                                    score = score,
-                                    "Score < {} \u{2192} SKIP",
+                                    combined = combined_score,
+                                    security = score,
+                                    opportunity = opp_score,
+                                    "Combined score < {} \u{2192} SKIP",
                                     analyzer_config.min_score_notify
                                 );
                             }
@@ -376,6 +502,7 @@ async fn main() -> Result<()> {
                                 error = %e,
                                 "Security analysis failed"
                             );
+                            error_timestamps.push(tokio::time::Instant::now());
                         }
                     }
                 }
@@ -388,7 +515,15 @@ async fn main() -> Result<()> {
     });
 
     // ── Spawn Price Feed ───────────────────────────────────────
-    let price_feed = PriceFeed::new(&config.jupiter_api_url, &config.jupiter_api_key, 3);
+    let price_rpc = Arc::new(solana_client::rpc_client::RpcClient::new(
+        config.effective_rpc_url().to_string(),
+    ));
+    let price_feed = PriceFeed::new(
+        &config.jupiter_api_url,
+        &config.jupiter_api_key,
+        trading_profile.price_poll_secs,
+        price_rpc,
+    );
     let price_positions = position_manager.clone();
     let mut price_shutdown = shutdown_tx.subscribe();
     let price_handle = tokio::spawn(async move {
@@ -409,7 +544,6 @@ async fn main() -> Result<()> {
     let (tpsl_monitor, tpsl_command_rx) = TpSlMonitor::create(
         Arc::new(config.clone()),
         position_manager.clone(),
-        3, // check every 3 seconds
     );
     let mut tpsl_shutdown = shutdown_tx.subscribe();
     let tpsl_handle = tokio::spawn(async move {
@@ -437,6 +571,8 @@ async fn main() -> Result<()> {
     let sell_executor = executor.clone();
     let sell_wallet = wallet_manager.clone();
     let sell_password = wallet_password.clone();
+    let sell_tg_bot = teloxide::Bot::new(&config.telegram_bot_token);
+    let sell_tg_chat = teloxide::types::ChatId(config.telegram_admin_chat_id);
     let sell_handle = tokio::spawn(async move {
         info!("Sell executor starting...");
         while let Some((mint, sell_pct)) = sell_rx.recv().await {
@@ -447,37 +583,117 @@ async fn main() -> Result<()> {
                 Ok(Some(active)) => match sell_wallet.get_keypair(&active.pubkey, &sell_password) {
                     Ok(kp) => kp,
                     Err(e) => {
-                        error!(error = %e, "Failed to decrypt wallet for sell");
+                        error!(error = %e, mint = %mint, "CRITICAL: Failed to decrypt wallet for sell");
+                        let _ = sell_tg_bot.send_message(
+                            sell_tg_chat,
+                            format!(
+                                "\u{1f6a8} <b>CRITICAL: Sell GAGAL — wallet decrypt error</b>\n\n\
+                                 \u{274c} Mint: <code>{}</code>\n\
+                                 \u{26a0}\u{fe0f} Error: {}\n\n\
+                                 <b>Posisi TIDAK bisa dijual otomatis!</b>\n\
+                                 Segera jual manual atau fix WALLET_PASSWORD.",
+                                mint, e
+                            ),
+                        ).parse_mode(teloxide::types::ParseMode::Html).await;
                         continue;
                     }
                 },
                 Ok(None) => {
-                    warn!("No active wallet set — cannot execute sell");
+                    error!(mint = %mint, "CRITICAL: No active wallet — cannot sell");
+                    let _ = sell_tg_bot.send_message(
+                        sell_tg_chat,
+                        format!(
+                            "\u{1f6a8} <b>CRITICAL: Sell GAGAL — no active wallet</b>\n\n\
+                             \u{274c} Mint: <code>{}</code>\n\n\
+                             <b>Set wallet aktif via /wallet segera!</b>",
+                            mint
+                        ),
+                    ).parse_mode(teloxide::types::ParseMode::Html).await;
                     continue;
                 }
                 Err(e) => {
-                    error!(error = %e, "Failed to get active wallet for sell");
+                    error!(error = %e, mint = %mint, "CRITICAL: Failed to get wallet for sell");
+                    let _ = sell_tg_bot.send_message(
+                        sell_tg_chat,
+                        format!(
+                            "\u{1f6a8} <b>CRITICAL: Sell GAGAL — wallet error</b>\n\n\
+                             \u{274c} Mint: <code>{}</code>\n\
+                             \u{26a0}\u{fe0f} Error: {}",
+                            mint, e
+                        ),
+                    ).parse_mode(teloxide::types::ParseMode::Html).await;
                     continue;
                 }
             };
 
-            match sell_executor.execute_sell(&mint, sell_pct, &keypair).await {
-                Ok(sig) => {
-                    info!(
+            // Retry sell up to 3 times with backoff on failure
+            let mut sell_ok = false;
+            for attempt in 0..3u32 {
+                if attempt > 0 {
+                    let delay = std::time::Duration::from_secs(1 << attempt);
+                    warn!(
                         mint = %mint,
-                        sell_pct = sell_pct,
-                        signature = %sig,
-                        "Sell executed successfully"
+                        attempt = attempt + 1,
+                        delay_secs = delay.as_secs(),
+                        "Retrying sell..."
                     );
+                    tokio::time::sleep(delay).await;
                 }
-                Err(e) => {
-                    error!(
-                        mint = %mint,
-                        sell_pct = sell_pct,
-                        error = %e,
-                        "Sell execution failed"
-                    );
+
+                match sell_executor.execute_sell(&mint, sell_pct, &keypair).await {
+                    Ok(sig) => {
+                        info!(
+                            mint = %mint,
+                            sell_pct = sell_pct,
+                            signature = %sig,
+                            "Sell executed successfully"
+                        );
+
+                        let _ = sell_tg_bot.send_message(
+                            sell_tg_chat,
+                            format!(
+                                "\u{1f4b0} <b>AUTO SELL Executed</b>\n\
+                                 \u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\n\n\
+                                 \u{1f4e6} <b>Mint:</b> <code>{}</code>\n\
+                                 \u{1f4ca} <b>Sell:</b> {}%\n\
+                                 \u{1f4dd} <b>Tx:</b> <code>{}</code>",
+                                mint, sell_pct, sig
+                            ),
+                        ).parse_mode(teloxide::types::ParseMode::Html).await;
+
+                        sell_ok = true;
+                        break;
+                    }
+                    Err(e) => {
+                        error!(
+                            mint = %mint,
+                            sell_pct = sell_pct,
+                            attempt = attempt + 1,
+                            error = %e,
+                            "Sell execution failed"
+                        );
+                    }
                 }
+            }
+
+            if !sell_ok {
+                // All 3 retries failed — emergency Telegram alert
+                error!(
+                    mint = %mint,
+                    sell_pct = sell_pct,
+                    "CRITICAL: Sell failed after 3 retries"
+                );
+                let _ = sell_tg_bot.send_message(
+                    sell_tg_chat,
+                    format!(
+                        "\u{1f6a8} <b>CRITICAL: Sell GAGAL 3x</b>\n\n\
+                         \u{274c} Mint: <code>{}</code>\n\
+                         \u{1f4ca} Sell %: {}%\n\n\
+                         <b>Bot tidak bisa jual posisi ini!</b>\n\
+                         Segera jual manual via /sell {}",
+                        mint, sell_pct, mint
+                    ),
+                ).parse_mode(teloxide::types::ParseMode::Html).await;
             }
         }
     });

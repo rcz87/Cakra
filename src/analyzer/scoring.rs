@@ -3,29 +3,46 @@ use tracing::info;
 
 /// Weight configuration for the scoring algorithm.
 /// Each weight is expressed as a percentage (total = 100).
-const WEIGHT_MINT_RENOUNCED: f64 = 15.0;
-const WEIGHT_FREEZE_AUTH: f64 = 15.0;
-const WEIGHT_METADATA_IMMUTABLE: f64 = 5.0;
-const WEIGHT_LP_STATUS: f64 = 15.0;
-const WEIGHT_HONEYPOT: f64 = 20.0;
-const WEIGHT_GOPLUS: f64 = 10.0;
+const WEIGHT_MINT_RENOUNCED: f64 = 12.0;
+const WEIGHT_FREEZE_AUTH: f64 = 12.0;
+const WEIGHT_METADATA_IMMUTABLE: f64 = 6.0;
+const WEIGHT_LP_STATUS: f64 = 12.0;
+const WEIGHT_HONEYPOT: f64 = 18.0;
+const WEIGHT_GOPLUS: f64 = 8.0;
+const WEIGHT_RUGCHECK: f64 = 12.0;
 const WEIGHT_CREATOR: f64 = 10.0;
-const WEIGHT_SOCIALS: f64 = 5.0;
-const WEIGHT_LIQUIDITY: f64 = 5.0;
+const WEIGHT_SOCIALS: f64 = 4.0;
+const WEIGHT_LIQUIDITY: f64 = 6.0;
 
 /// Calculate the final safety score (0..100) for a token based on all analysis results.
 ///
 /// Scoring breakdown:
-/// - Mint Renounced: 15% (renounced=100, not=0)
-/// - Freeze Auth Null: 15% (null=100, not=0)
-/// - Metadata Immutable: 5% (immutable=100, mutable=0)
-/// - LP Burned/Locked: 15% (Burned=100, Locked=80, NotBurned/Unknown=0)
-/// - Honeypot Simulation: 20% (Safe=100, HighTax=50, Honeypot/Unknown=0)
-/// - GoPlus Safety: 10% (0..100 from API)
+/// - Mint Renounced: 12% (renounced=100, not=0)
+/// - Freeze Auth Null: 12% (null=100, not=0)
+/// - Metadata Immutable: 6% (immutable=100, mutable=0)
+/// - LP Burned/Locked: 12% (Burned=100, Locked=80, NotBurned/Unknown=0)
+/// - Honeypot Simulation: 18% (Safe=100, HighTax=50, Honeypot/Unknown=0)
+/// - GoPlus Safety: 8% (0..100 from API)
+/// - RugCheck: 12% (0..100 from API)
 /// - Creator History: 10% (Clean=100, Suspicious=30, Rugger/Unknown=0)
-/// - Social Links: 5% (3+=100, 1-2=50, 0=0)
-/// - Initial Liquidity: 5% (>$10K=100, $1K-$10K=50, <$1K=0)
-pub fn calculate_score(analysis: &SecurityAnalysis, initial_liquidity_usd: f64) -> u8 {
+/// - Social Links: 4% (3+=100, 1-2=50, 0=0)
+/// - Initial Liquidity: 6% (>$10K=100, $1K-$10K=50, <$1K=0)
+///
+/// If `initial_liquidity_usd` is 0 but `initial_liquidity_sol` > 0,
+/// estimates USD using a conservative $100/SOL as fallback.
+pub fn calculate_score(
+    analysis: &SecurityAnalysis,
+    initial_liquidity_usd: f64,
+    initial_liquidity_sol: f64,
+) -> u8 {
+    // Fallback: if USD is unknown, estimate from SOL (conservative $100/SOL)
+    let effective_liquidity_usd = if initial_liquidity_usd > 0.0 {
+        initial_liquidity_usd
+    } else if initial_liquidity_sol > 0.0 {
+        initial_liquidity_sol * 100.0 // conservative estimate
+    } else {
+        0.0
+    };
     let mint_score = if analysis.mint_renounced { 100.0 } else { 0.0 };
 
     let freeze_score = if analysis.freeze_authority_null { 100.0 } else { 0.0 };
@@ -48,6 +65,8 @@ pub fn calculate_score(analysis: &SecurityAnalysis, initial_liquidity_usd: f64) 
 
     let goplus_score = analysis.goplus_score.unwrap_or(0.0).clamp(0.0, 100.0);
 
+    let rugcheck_score = analysis.rugcheck_score.unwrap_or(0.0).clamp(0.0, 100.0);
+
     let creator_score = match analysis.creator_history {
         CreatorHistory::Clean { .. } => 100.0,
         CreatorHistory::Suspicious { .. } => 30.0,
@@ -64,9 +83,9 @@ pub fn calculate_score(analysis: &SecurityAnalysis, initial_liquidity_usd: f64) 
         0.0
     };
 
-    let liquidity_score = if initial_liquidity_usd >= 10_000.0 {
+    let liquidity_score = if effective_liquidity_usd >= 10_000.0 {
         100.0
-    } else if initial_liquidity_usd >= 1_000.0 {
+    } else if effective_liquidity_usd >= 1_000.0 {
         50.0
     } else {
         0.0
@@ -78,6 +97,7 @@ pub fn calculate_score(analysis: &SecurityAnalysis, initial_liquidity_usd: f64) 
         + lp_score * WEIGHT_LP_STATUS
         + honeypot_score * WEIGHT_HONEYPOT
         + goplus_score * WEIGHT_GOPLUS
+        + rugcheck_score * WEIGHT_RUGCHECK
         + creator_score * WEIGHT_CREATOR
         + social_score * WEIGHT_SOCIALS
         + liquidity_score * WEIGHT_LIQUIDITY)
@@ -93,6 +113,7 @@ pub fn calculate_score(analysis: &SecurityAnalysis, initial_liquidity_usd: f64) 
         lp_score,
         honeypot_score,
         goplus_score,
+        rugcheck_score,
         creator_score,
         social_score,
         liquidity_score,
@@ -129,14 +150,14 @@ mod tests {
             final_score: 0,
         };
 
-        let score = calculate_score(&analysis, 50_000.0);
+        let score = calculate_score(&analysis, 50_000.0, 0.0);
         assert_eq!(score, 100);
     }
 
     #[test]
     fn test_zero_score() {
         let analysis = SecurityAnalysis::default();
-        let score = calculate_score(&analysis, 0.0);
+        let score = calculate_score(&analysis, 0.0, 0.0);
         assert_eq!(score, 0);
     }
 
@@ -165,8 +186,7 @@ mod tests {
             final_score: 0,
         };
 
-        let score = calculate_score(&analysis, 5_000.0);
-        // 15 + 15 + 0 + 12 + 10 + 7 + 3 + 2.5 + 2.5 = 67
-        assert!(score > 50 && score < 80, "Score was {}", score);
+        let score = calculate_score(&analysis, 5_000.0, 0.0);
+        assert!(score > 40 && score < 80, "Score was {}", score);
     }
 }

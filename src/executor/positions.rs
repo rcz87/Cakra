@@ -6,6 +6,7 @@ use chrono::Utc;
 use tracing::{info, warn};
 use uuid::Uuid;
 
+use crate::config::TradingProfile;
 use crate::db::DbPool;
 use crate::models::position::PositionStatus;
 use crate::models::Position;
@@ -16,13 +17,15 @@ pub struct PositionManager {
     /// In-memory position cache keyed by token mint.
     positions: Arc<RwLock<HashMap<String, Position>>>,
     db: DbPool,
+    profile: TradingProfile,
 }
 
 impl PositionManager {
-    pub fn new(db: DbPool) -> Self {
+    pub fn new(db: DbPool, profile: TradingProfile) -> Self {
         Self {
             positions: Arc::new(RwLock::new(HashMap::new())),
             db,
+            profile,
         }
     }
 
@@ -59,9 +62,9 @@ impl PositionManager {
             token_amount,
             current_price_sol: entry_price_sol,
             highest_price_sol: entry_price_sol,
-            take_profit_pct: 100.0, // default 100% TP
-            stop_loss_pct: 50.0,    // default 50% SL
-            trailing_stop_pct: Some(30.0), // default 30% trailing
+            take_profit_pct: self.profile.take_profit_pct,
+            stop_loss_pct: self.profile.stop_loss_pct,
+            trailing_stop_pct: Some(self.profile.trailing_stop_pct),
             pnl_sol: 0.0,
             pnl_pct: 0.0,
             status: PositionStatus::Open,

@@ -6,7 +6,7 @@ use anyhow::Result;
 use tokio::sync::{mpsc, Mutex};
 use tracing::{error, info, warn};
 
-use crate::config::Config;
+use crate::config::{Config, TradingMode, TradingProfile};
 use crate::models::Position;
 
 use super::positions::PositionManager;
@@ -18,13 +18,38 @@ pub struct TpSlTier {
     pub sell_pct: u8,       // % of remaining position to sell
 }
 
-/// Default graduated TP tiers.
-pub fn default_tp_tiers() -> Vec<TpSlTier> {
+/// TP tiers for Snipe mode — instant all-or-nothing exit at +5%.
+pub fn snipe_tp_tiers() -> Vec<TpSlTier> {
+    vec![
+        TpSlTier { trigger_pct: 5.0, sell_pct: 100 },    // +5% → sell ALL immediately
+    ]
+}
+
+/// TP tiers for Scalp mode — fast, aggressive exits.
+pub fn scalp_tp_tiers() -> Vec<TpSlTier> {
+    vec![
+        TpSlTier { trigger_pct: 10.0, sell_pct: 50 },   // +10% → sell 50%
+        TpSlTier { trigger_pct: 20.0, sell_pct: 70 },   // +20% → sell 70% of remaining
+        TpSlTier { trigger_pct: 50.0, sell_pct: 100 },   // +50% → sell all remaining
+    ]
+}
+
+/// TP tiers for Hold mode — patient, wide exits for liquid tokens.
+pub fn hold_tp_tiers() -> Vec<TpSlTier> {
     vec![
         TpSlTier { trigger_pct: 50.0, sell_pct: 50 },   // +50% → sell 50%
         TpSlTier { trigger_pct: 100.0, sell_pct: 60 },  // +100% → sell 60% of remaining
         TpSlTier { trigger_pct: 200.0, sell_pct: 100 },  // +200% → sell all remaining
     ]
+}
+
+/// Get TP tiers for a given trading mode.
+pub fn tp_tiers_for_mode(mode: TradingMode) -> Vec<TpSlTier> {
+    match mode {
+        TradingMode::Snipe => snipe_tp_tiers(),
+        TradingMode::Scalp => scalp_tp_tiers(),
+        TradingMode::Hold => hold_tp_tiers(),
+    }
 }
 
 /// Commands sent from the TP/SL monitor to the executor for auto-selling.
@@ -69,6 +94,13 @@ pub enum TpSlCommand {
         age_secs: u64,
         pnl_pct: f64,
     },
+    /// Max age exit — profitable position exceeded max hold time.
+    MaxAgeExit {
+        mint: String,
+        symbol: String,
+        age_secs: u64,
+        pnl_pct: f64,
+    },
 }
 
 /// Take-profit / stop-loss monitor that runs as a background tokio task.
@@ -77,6 +109,7 @@ pub enum TpSlCommand {
 /// TP, SL, or trailing stop conditions are met.
 pub struct TpSlMonitor {
     config: Arc<Config>,
+    profile: TradingProfile,
     positions: PositionManager,
     command_tx: mpsc::Sender<TpSlCommand>,
     check_interval: Duration,
@@ -96,14 +129,26 @@ impl TpSlMonitor {
         config: Arc<Config>,
         positions: PositionManager,
         command_tx: mpsc::Sender<TpSlCommand>,
-        check_interval_secs: u64,
     ) -> Self {
+        let profile = config.trading_profile();
+        let check_interval = profile.tpsl_check_secs;
+        let tp_tiers = tp_tiers_for_mode(profile.mode);
+        info!(
+            mode = %profile.mode,
+            check_secs = check_interval,
+            tiers = tp_tiers.len(),
+            sl = profile.stop_loss_pct,
+            trailing = profile.trailing_stop_pct,
+            time_stop_secs = profile.time_stop_secs,
+            "TpSlMonitor configured"
+        );
         Self {
             config,
+            profile,
             positions,
             command_tx,
-            check_interval: Duration::from_secs(check_interval_secs),
-            tp_tiers: default_tp_tiers(),
+            check_interval: Duration::from_secs(check_interval),
+            tp_tiers,
             triggered_tiers: Arc::new(Mutex::new(HashMap::new())),
         }
     }
@@ -115,10 +160,9 @@ impl TpSlMonitor {
     pub fn create(
         config: Arc<Config>,
         positions: PositionManager,
-        check_interval_secs: u64,
     ) -> (Self, mpsc::Receiver<TpSlCommand>) {
         let (tx, rx) = mpsc::channel(64);
-        let monitor = Self::new(config, positions, tx, check_interval_secs);
+        let monitor = Self::new(config, positions, tx);
         (monitor, rx)
     }
 
@@ -210,13 +254,18 @@ impl TpSlMonitor {
             return;
         }
 
-        // Time stop: if position is open > 600 seconds (10 min) and PnL < 10%, exit
-        if pos.age_secs > 600 && pos.pnl_pct < 10.0 {
+        // Time stop: exit stale position that isn't profitable enough
+        let ts_secs = self.profile.time_stop_secs;
+        let ts_min_pnl = self.profile.time_stop_min_pnl;
+        if pos.age_secs > ts_secs && pos.pnl_pct < ts_min_pnl {
             warn!(
                 mint = %pos.token_mint,
                 symbol = %pos.token_symbol,
                 age_secs = pos.age_secs,
                 pnl_pct = pos.pnl_pct,
+                threshold_secs = ts_secs,
+                min_pnl = ts_min_pnl,
+                mode = %self.profile.mode,
                 "Time stop triggered — position stale"
             );
 
@@ -229,6 +278,32 @@ impl TpSlMonitor {
 
             if let Err(e) = self.command_tx.send(cmd).await {
                 error!("Failed to send time stop command: {e}");
+            }
+            return;
+        }
+
+        // Max age exit: force sell profitable position past max hold time
+        let max_hold = self.profile.max_hold_secs;
+        let max_age_min = self.profile.max_age_min_pnl;
+        if max_hold > 0 && pos.age_secs > max_hold && pos.pnl_pct > max_age_min {
+            warn!(
+                mint = %pos.token_mint,
+                symbol = %pos.token_symbol,
+                age_secs = pos.age_secs,
+                max_hold_secs = max_hold,
+                pnl_pct = pos.pnl_pct,
+                "Max age exit triggered — profitable position exceeded max hold time"
+            );
+
+            let cmd = TpSlCommand::MaxAgeExit {
+                mint: pos.token_mint.clone(),
+                symbol: pos.token_symbol.clone(),
+                age_secs: pos.age_secs,
+                pnl_pct: pos.pnl_pct,
+            };
+
+            if let Err(e) = self.command_tx.send(cmd).await {
+                error!("Failed to send max age exit command: {e}");
             }
             return;
         }
@@ -272,8 +347,9 @@ impl TpSlMonitor {
             }
         }
 
-        // Trailing stop: only activates after PnL > 30%
-        if pos.pnl_pct > 30.0 && pos.should_trailing_stop() {
+        // Trailing stop: only activates after PnL > trailing_gate_pct
+        let gate = self.profile.trailing_gate_pct;
+        if pos.pnl_pct > gate && pos.should_trailing_stop() {
             let drop_from_high = if pos.highest_price_sol > 0.0 {
                 ((pos.highest_price_sol - pos.current_price_sol) / pos.highest_price_sol) * 100.0
             } else {
@@ -286,7 +362,8 @@ impl TpSlMonitor {
                 drop_pct = drop_from_high,
                 highest = pos.highest_price_sol,
                 current = pos.current_price_sol,
-                "Trailing stop triggered (after 30% profit gate)"
+                gate_pct = gate,
+                "Trailing stop triggered"
             );
 
             let cmd = TpSlCommand::TrailingStop {
@@ -395,6 +472,17 @@ pub async fn process_tp_sl_commands(
                 );
                 if let Err(e) = sell_tx.send((mint, 100)).await {
                     error!("Failed to dispatch time stop sell: {e}");
+                }
+            }
+            TpSlCommand::MaxAgeExit { mint, symbol, age_secs, pnl_pct } => {
+                warn!(
+                    symbol = %symbol,
+                    age_secs = age_secs,
+                    pnl_pct = pnl_pct,
+                    "Processing max age exit: selling 100%"
+                );
+                if let Err(e) = sell_tx.send((mint, 100)).await {
+                    error!("Failed to dispatch max age exit sell: {e}");
                 }
             }
         }

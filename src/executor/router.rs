@@ -3,7 +3,7 @@ use chrono::Utc;
 use solana_client::rpc_client::RpcClient;
 use tracing::{debug, info, warn};
 
-use crate::config::Config;
+use crate::config::{Config, TradingMode};
 use crate::models::token::{TokenInfo, TokenSource};
 
 use super::jupiter::JupiterClient;
@@ -60,16 +60,62 @@ pub async fn find_best_route(
     slippage_bps: u16,
     jupiter: &JupiterClient,
     _rpc: &RpcClient,
-    _config: &Config,
+    config: &Config,
 ) -> Result<Route> {
+    let token_age_secs = Utc::now()
+        .signed_duration_since(token.detected_at)
+        .num_seconds();
+
     info!(
         mint = %token.mint,
         amount_sol = amount_sol,
         source = %token.source,
+        age_secs = token_age_secs,
+        mode = %config.trading_mode,
         "Finding best route"
     );
 
-    // 1. Try Jupiter aggregator (covers Raydium, PumpFun, and all other DEXes)
+    // For snipe mode + PumpFun + very new token: try PumpFun direct FIRST
+    // (fastest path — don't waste time on Jupiter for tokens it hasn't indexed yet)
+    let pumpfun_first = config.trading_mode == TradingMode::Snipe
+        && matches!(token.source, TokenSource::PumpFun)
+        && token_age_secs < PUMPFUN_FALLBACK_AGE_SECS;
+
+    if pumpfun_first {
+        info!(
+            mint = %token.mint,
+            age_secs = token_age_secs,
+            "Snipe mode: trying PumpFun direct FIRST (skip Jupiter)"
+        );
+
+        match get_pumpfun_quote(token, amount_sol).await {
+            Ok(candidate) if candidate.expected_output > 0 && candidate.price_impact <= 20.0 => {
+                let min_output = calculate_min_output(candidate.expected_output, slippage_bps);
+                let route = Route {
+                    route_type: RouteType::PumpFun,
+                    expected_output: candidate.expected_output,
+                    min_output,
+                    price_impact_pct: candidate.price_impact,
+                    estimated_fee_lamports: 0,
+                };
+                info!(
+                    route = ?route.route_type,
+                    expected_output = route.expected_output,
+                    price_impact = route.price_impact_pct,
+                    "PumpFun-first route selected (snipe mode)"
+                );
+                return Ok(route);
+            }
+            Ok(_) => {
+                warn!("PumpFun-first: quote rejected (zero output or high impact), trying Jupiter");
+            }
+            Err(e) => {
+                warn!("PumpFun-first: quote failed: {e}, trying Jupiter");
+            }
+        }
+    }
+
+    // Standard path: try Jupiter aggregator first
     match get_jupiter_quote(jupiter, &token.mint, amount_sol, slippage_bps).await {
         Ok(candidate) => {
             debug!(
@@ -112,10 +158,6 @@ pub async fn find_best_route(
     }
 
     // 2. If Jupiter had no route and token is from PumpFun and very new, try direct bonding curve
-    let token_age_secs = Utc::now()
-        .signed_duration_since(token.detected_at)
-        .num_seconds();
-
     if matches!(token.source, TokenSource::PumpFun) && token_age_secs < PUMPFUN_FALLBACK_AGE_SECS {
         info!(
             mint = %token.mint,

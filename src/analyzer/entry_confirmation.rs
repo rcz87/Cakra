@@ -1,7 +1,7 @@
 use anyhow::Result;
 use tracing::{info, warn};
 
-use crate::models::token::TokenInfo;
+use crate::models::token::{TokenInfo, TokenSource};
 
 /// Configuration for entry confirmation delay.
 pub struct EntryConfirmation {
@@ -134,4 +134,50 @@ pub async fn confirm_entry(
             )))
         }
     }
+}
+
+/// Fast entry confirmation for snipe mode — no Jupiter dependency.
+///
+/// Checks:
+/// 1. Token has minimum liquidity (from detection data)
+/// 2. Token source is supported (PumpFun, Raydium, PumpSwap)
+/// 3. Token is not too old (stale snipe = bad risk/reward)
+///
+/// Does NOT call any external APIs — pure local data check.
+pub fn confirm_entry_fast(token: &TokenInfo) -> EntryDecision {
+    // Reject if liquidity too low
+    if token.initial_liquidity_sol < 1.0 {
+        return EntryDecision::Reject(format!(
+            "Liquidity too low for snipe: {:.2} SOL (min 1.0)",
+            token.initial_liquidity_sol
+        ));
+    }
+
+    // Reject if token source is unknown/unsupported
+    if matches!(token.source, TokenSource::Unknown) {
+        return EntryDecision::Reject(
+            "Unknown token source — cannot snipe safely".to_string(),
+        );
+    }
+
+    // Reject if token is too old for snipe (> 60 seconds since detection)
+    let age_secs = chrono::Utc::now()
+        .signed_duration_since(token.detected_at)
+        .num_seconds();
+    if age_secs > 60 {
+        return EntryDecision::Reject(format!(
+            "Token too old for snipe: {}s since detection (max 60s)",
+            age_secs
+        ));
+    }
+
+    info!(
+        mint = %token.mint,
+        liquidity_sol = token.initial_liquidity_sol,
+        age_secs = age_secs,
+        source = %token.source,
+        "Fast entry confirmation passed"
+    );
+
+    EntryDecision::Proceed
 }

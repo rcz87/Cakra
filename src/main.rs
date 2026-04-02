@@ -25,7 +25,7 @@ use crate::risk::{CooldownManager, ListManager, RiskManager};
 use crate::telegram::TelegramBot;
 use crate::wallet::WalletManager;
 
-use crate::analyzer::entry_confirmation::{confirm_entry, EntryConfirmation, EntryDecision};
+use crate::analyzer::entry_confirmation::{confirm_entry, confirm_entry_fast, EntryConfirmation, EntryDecision};
 use crate::analyzer::AnalyzerService;
 use crate::detector::DetectorService;
 use crate::executor::positions::PositionManager;
@@ -190,6 +190,16 @@ async fn main() -> Result<()> {
             analyzer_config.effective_rpc_url().to_string(),
         );
 
+        // SOL price tracker for accurate liquidity USD conversion + opportunity scoring
+        let sol_tracker = crate::analyzer::opportunity::SolTrendTracker::new(
+            &analyzer_config.jupiter_api_key,
+        );
+        // Fetch initial SOL price
+        let mut sol_usd_price: f64 = match sol_tracker.fetch_and_record().await {
+            Ok(p) => { info!(sol_price = p, "Initial SOL price fetched"); p }
+            Err(e) => { warn!(error = %e, "Failed to fetch SOL price, using $150 fallback"); 150.0 }
+        };
+
         // Telegram bot instance for sending notifications
         let tg_bot = teloxide::Bot::new(&analyzer_config.telegram_bot_token);
         let tg_chat = teloxide::types::ChatId(analyzer_config.telegram_admin_chat_id);
@@ -283,21 +293,29 @@ async fn main() -> Result<()> {
                                 );
                             }
 
-                            // Compute opportunity score (basic: uses available data)
+                            // Refresh SOL price periodically (every ~30 tokens)
+                            if let Ok(p) = sol_tracker.fetch_and_record().await {
+                                sol_usd_price = p;
+                            }
+                            let sol_trend = sol_tracker.get_1h_change_pct();
+
+                            // Compute opportunity score with live SOL data
+                            let effective_liq_usd = if token.initial_liquidity_usd > 0.0 {
+                                token.initial_liquidity_usd
+                            } else {
+                                token.initial_liquidity_sol * sol_usd_price
+                            };
+
                             let opp_analysis = crate::analyzer::opportunity::OpportunityAnalysis {
                                 buy_count: 0,             // TODO: track from gRPC stream
                                 unique_buyers: 0,         // TODO: track from gRPC stream
-                                seconds_since_creation: token.detected_at
-                                    .signed_duration_since(chrono::Utc::now())
+                                seconds_since_creation: chrono::Utc::now()
+                                    .signed_duration_since(token.detected_at)
                                     .num_seconds()
                                     .unsigned_abs(),
-                                liquidity_usd: if token.initial_liquidity_usd > 0.0 {
-                                    token.initial_liquidity_usd
-                                } else {
-                                    token.initial_liquidity_sol * 100.0 // conservative
-                                },
-                                price_change_pct: 0.0,    // TODO: track price delta
-                                sol_trend_1h_pct: 0.0,    // TODO: wire SolTrendTracker
+                                liquidity_usd: effective_liq_usd,
+                                price_change_pct: 0.0,    // TODO: track price delta from gRPC
+                                sol_trend_1h_pct: sol_trend,
                                 largest_buyer_pct: 0.0,   // TODO: track from gRPC
                                 opportunity_score: 0,
                             };
@@ -323,13 +341,13 @@ async fn main() -> Result<()> {
                                     analyzer_config.min_score_auto_buy
                                 );
 
-                                // Entry confirmation check (skip delay for snipe mode)
-                                let entry_conf = if analyzer_config.trading_mode == crate::config::TradingMode::Snipe {
-                                    EntryConfirmation { delay_secs: 0, ..EntryConfirmation::default() }
+                                // Entry confirmation: fast (no Jupiter) for snipe, full for others
+                                let entry_decision = if analyzer_config.trading_mode == crate::config::TradingMode::Snipe {
+                                    Ok(confirm_entry_fast(&token))
                                 } else {
-                                    EntryConfirmation::default()
+                                    confirm_entry(&token, &analyzer_config.jupiter_api_url, &EntryConfirmation::default()).await
                                 };
-                                match confirm_entry(&token, &analyzer_config.jupiter_api_url, &entry_conf).await {
+                                match entry_decision {
                                     Ok(EntryDecision::Proceed) => {
                                         // Confirmed — continue to buy
                                     }

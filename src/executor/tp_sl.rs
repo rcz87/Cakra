@@ -18,6 +18,13 @@ pub struct TpSlTier {
     pub sell_pct: u8,       // % of remaining position to sell
 }
 
+/// TP tiers for Snipe mode — instant all-or-nothing exit at +5%.
+pub fn snipe_tp_tiers() -> Vec<TpSlTier> {
+    vec![
+        TpSlTier { trigger_pct: 5.0, sell_pct: 100 },    // +5% → sell ALL immediately
+    ]
+}
+
 /// TP tiers for Scalp mode — fast, aggressive exits.
 pub fn scalp_tp_tiers() -> Vec<TpSlTier> {
     vec![
@@ -39,6 +46,7 @@ pub fn hold_tp_tiers() -> Vec<TpSlTier> {
 /// Get TP tiers for a given trading mode.
 pub fn tp_tiers_for_mode(mode: TradingMode) -> Vec<TpSlTier> {
     match mode {
+        TradingMode::Snipe => snipe_tp_tiers(),
         TradingMode::Scalp => scalp_tp_tiers(),
         TradingMode::Hold => hold_tp_tiers(),
     }

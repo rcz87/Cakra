@@ -5,6 +5,8 @@ use std::fmt;
 /// Trading mode determines TP/SL thresholds, timing, and exit behavior.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TradingMode {
+    /// PumpFun snipe — buy small, exit fast at +5%. All-or-nothing.
+    Snipe,
     /// Fast in/out for new tokens. Tight TP/SL, fast exits.
     Scalp,
     /// Hold for established/liquid tokens. Wide TP tiers, longer holds.
@@ -14,6 +16,7 @@ pub enum TradingMode {
 impl fmt::Display for TradingMode {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            TradingMode::Snipe => write!(f, "snipe"),
             TradingMode::Scalp => write!(f, "scalp"),
             TradingMode::Hold => write!(f, "hold"),
         }
@@ -44,6 +47,19 @@ pub struct TradingProfile {
 impl TradingProfile {
     pub fn from_mode(mode: TradingMode, max_hold_override: u64) -> Self {
         match mode {
+            TradingMode::Snipe => Self {
+                mode,
+                take_profit_pct: 5.0,
+                stop_loss_pct: 5.0,
+                trailing_stop_pct: 3.0,
+                trailing_gate_pct: 3.0,
+                time_stop_secs: 30,        // 30 detik
+                time_stop_min_pnl: 1.0,    // exit jika PnL < 1% setelah 30s
+                max_hold_secs: if max_hold_override > 0 { max_hold_override } else { 120 }, // 2 min
+                max_age_min_pnl: 2.0,
+                price_poll_secs: 1,
+                tpsl_check_secs: 1,
+            },
             TradingMode::Scalp => Self {
                 mode,
                 take_profit_pct: 20.0,
@@ -207,10 +223,11 @@ impl Config {
                 .to_lowercase()
                 .as_str()
             {
+                "snipe" => TradingMode::Snipe,
                 "scalp" => TradingMode::Scalp,
                 "hold" => TradingMode::Hold,
                 other => anyhow::bail!(
-                    "Invalid TRADING_MODE '{}': must be 'scalp' or 'hold'",
+                    "Invalid TRADING_MODE '{}': must be 'snipe', 'scalp', or 'hold'",
                     other
                 ),
             },

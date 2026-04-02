@@ -325,10 +325,29 @@ impl ExecutorService {
             }
         };
 
+        // Slippage reality check — warn if actual output much worse than quoted
+        let slippage_actual_pct = if expected_output > 0 {
+            ((expected_output as f64 - actual_output as f64) / expected_output as f64) * 100.0
+        } else {
+            0.0
+        };
+        if slippage_actual_pct > slippage_bps as f64 / 100.0 {
+            warn!(
+                mint = %token.mint,
+                signature = %signature,
+                expected = expected_output,
+                actual = actual_output,
+                slippage_pct = format!("{:.2}", slippage_actual_pct),
+                slippage_limit = slippage_bps as f64 / 100.0,
+                "Actual slippage EXCEEDED configured limit — got fewer tokens than expected"
+            );
+        }
+
         info!(
             signature = %signature,
             expected_output = expected_output,
             actual_output = actual_output,
+            slippage_pct = format!("{:.2}", slippage_actual_pct),
             "Buy confirmed — balance verified on-chain"
         );
 

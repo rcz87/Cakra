@@ -32,6 +32,7 @@ use self::jito::JitoClient;
 use self::jupiter::{JupiterClient, to_solana_instruction};
 use self::positions::PositionManager;
 use self::retry::retry_with_backoff;
+use self::router::{find_best_route, RouteType};
 
 /// Central executor service that coordinates all trading operations
 /// for the RICOZ SNIPER bot.
@@ -127,58 +128,119 @@ impl ExecutorService {
         }
 
         let amount_lamports = (amount_sol * 1_000_000_000.0) as u64;
-        let wsol_mint = "So11111111111111111111111111111111111111112";
         let taker = wallet.pubkey().to_string();
 
-        // 1. Get a quote from Jupiter Swap API
-        let quote = retry_with_backoff(
-            || {
-                let jupiter = self.jupiter.clone();
-                let mint = token.mint.clone();
-                async move {
-                    jupiter
-                        .get_quote(wsol_mint, &mint, amount_lamports, slippage_bps)
-                        .await
-                }
-            },
-            3,
+        // 1. Find best route (Jupiter aggregator or PumpFun direct for new tokens)
+        let route = find_best_route(
+            token,
+            amount_lamports,
+            slippage_bps,
+            &self.jupiter,
+            &self.rpc,
+            &self.config,
         )
         .await
-        .context("Failed to get Jupiter quote")?;
+        .context("No viable route found for buy")?;
 
-        let expected_output: u64 = quote
-            .out_amount
-            .parse()
-            .context("Failed to parse Jupiter out_amount")?;
         info!(
-            expected_output = expected_output,
-            slippage_bps = slippage_bps,
-            price_impact = %quote.price_impact_pct,
-            "Jupiter quote received for buy"
+            mint = %token.mint,
+            route = ?route.route_type,
+            expected_output = route.expected_output,
+            price_impact = route.price_impact_pct,
+            "Route selected for buy"
         );
 
-        // 2. Get swap instructions from Jupiter
-        let swap_ixs = self
-            .jupiter
-            .get_swap_instructions(&quote, &taker)
-            .await
-            .context("Failed to get Jupiter swap instructions")?;
+        let expected_output = route.expected_output;
 
-        // 3. Build transaction from instructions
+        // 2. Build instructions based on route type
         let mut instructions = Vec::new();
-        for ix in &swap_ixs.compute_budget_instructions {
-            instructions.push(to_solana_instruction(ix)?);
-        }
-        for ix in &swap_ixs.setup_instructions {
-            instructions.push(to_solana_instruction(ix)?);
-        }
-        instructions.push(to_solana_instruction(&swap_ixs.swap_instruction)?);
-        if let Some(cleanup) = &swap_ixs.cleanup_instruction {
-            instructions.push(to_solana_instruction(cleanup)?);
-        }
-        if let Some(other) = &swap_ixs.other_instructions {
-            for ix in other {
-                instructions.push(to_solana_instruction(ix)?);
+
+        match route.route_type {
+            RouteType::PumpFun => {
+                // Direct PumpFun bonding curve buy — fastest path for new tokens
+                let mint_pubkey: Pubkey = token.mint.parse()
+                    .context("Invalid mint pubkey")?;
+
+                // Create buyer ATA if needed
+                let buyer_ata = pumpfun_buy::derive_buyer_token_account(
+                    &wallet.pubkey(), &mint_pubkey,
+                )?;
+                let token_program: Pubkey = "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA"
+                    .parse().unwrap();
+                let ata_program: Pubkey = "ATokenGPvbdGVxr1b2hvZbsiqW5xWH25efTNsLJA8knL"
+                    .parse().unwrap();
+
+                // Create ATA instruction (idempotent — will succeed even if ATA exists)
+                instructions.push(
+                    spl_associated_token_account::instruction::create_associated_token_account_idempotent(
+                        &wallet.pubkey(),
+                        &wallet.pubkey(),
+                        &mint_pubkey,
+                        &token_program,
+                    )
+                );
+
+                // PumpFun buy instruction
+                instructions.push(
+                    pumpfun_buy::build_pumpfun_buy(
+                        &mint_pubkey,
+                        amount_lamports,
+                        slippage_bps,
+                        &wallet.pubkey(),
+                    )?
+                );
+
+                info!(
+                    mint = %token.mint,
+                    buyer_ata = %buyer_ata,
+                    "Built PumpFun direct buy instructions"
+                );
+            }
+            RouteType::Jupiter => {
+                // Jupiter aggregated route — broader coverage, slightly slower
+                let wsol_mint = "So11111111111111111111111111111111111111112";
+                let quote = retry_with_backoff(
+                    || {
+                        let jupiter = self.jupiter.clone();
+                        let mint = token.mint.clone();
+                        async move {
+                            jupiter
+                                .get_quote(wsol_mint, &mint, amount_lamports, slippage_bps)
+                                .await
+                        }
+                    },
+                    3,
+                )
+                .await
+                .context("Failed to get Jupiter quote")?;
+
+                info!(
+                    slippage_bps = slippage_bps,
+                    price_impact = %quote.price_impact_pct,
+                    "Jupiter quote received for buy"
+                );
+
+                let swap_ixs = self
+                    .jupiter
+                    .get_swap_instructions(&quote, &taker)
+                    .await
+                    .context("Failed to get Jupiter swap instructions")?;
+
+                for ix in &swap_ixs.compute_budget_instructions {
+                    instructions.push(to_solana_instruction(ix)?);
+                }
+                for ix in &swap_ixs.setup_instructions {
+                    instructions.push(to_solana_instruction(ix)?);
+                }
+                instructions.push(to_solana_instruction(&swap_ixs.swap_instruction)?);
+                if let Some(cleanup) = &swap_ixs.cleanup_instruction {
+                    instructions.push(to_solana_instruction(cleanup)?);
+                }
+                if let Some(other) = &swap_ixs.other_instructions {
+                    for ix in other {
+                        instructions.push(to_solana_instruction(ix)?);
+                    }
+                }
             }
         }
 

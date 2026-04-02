@@ -10,6 +10,7 @@ solana-sdk = "2.2"
 solana-client = "2.2"
 solana-transaction-status = "2.2"
 spl-token = "6.0"
+spl-associated-token-account = "6.0"
 
 # gRPC (Yellowstone) - v6 for solana 2.2
 yellowstone-grpc-client = { git = "https://github.com/rpcpool/yellowstone-grpc.git", tag = "v6.0.0+solana.2.2.12" }

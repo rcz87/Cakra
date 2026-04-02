@@ -258,8 +258,13 @@ async fn main() -> Result<()> {
                         warn!(error = %e, "Failed to store token in database");
                     }
 
-                    // Run security analysis
-                    match analyzer.analyze_token(&token, &rpc).await {
+                    // Run security analysis (fast filter for snipe mode, full for others)
+                    let analysis_result = if analyzer_config.trading_mode == crate::config::TradingMode::Snipe {
+                        analyzer.analyze_token_fast(&token, &rpc).await
+                    } else {
+                        analyzer.analyze_token(&token, &rpc).await
+                    };
+                    match analysis_result {
                         Ok(analysis) => {
                             let score = analysis.final_score;
                             info!(
@@ -278,8 +283,39 @@ async fn main() -> Result<()> {
                                 );
                             }
 
+                            // Compute opportunity score (basic: uses available data)
+                            let opp_analysis = crate::analyzer::opportunity::OpportunityAnalysis {
+                                buy_count: 0,             // TODO: track from gRPC stream
+                                unique_buyers: 0,         // TODO: track from gRPC stream
+                                seconds_since_creation: token.detected_at
+                                    .signed_duration_since(chrono::Utc::now())
+                                    .num_seconds()
+                                    .unsigned_abs(),
+                                liquidity_usd: if token.initial_liquidity_usd > 0.0 {
+                                    token.initial_liquidity_usd
+                                } else {
+                                    token.initial_liquidity_sol * 100.0 // conservative
+                                },
+                                price_change_pct: 0.0,    // TODO: track price delta
+                                sol_trend_1h_pct: 0.0,    // TODO: wire SolTrendTracker
+                                largest_buyer_pct: 0.0,   // TODO: track from gRPC
+                                opportunity_score: 0,
+                            };
+                            let opp_score = crate::analyzer::opportunity::calculate_opportunity_score(&opp_analysis);
+
+                            // Combined score: 60% security + 40% opportunity
+                            let combined_score = ((score as f64 * 0.6) + (opp_score as f64 * 0.4)).round() as u8;
+
+                            info!(
+                                mint = %token.mint,
+                                security_score = score,
+                                opportunity_score = opp_score,
+                                combined_score = combined_score,
+                                "Combined scoring complete"
+                            );
+
                             // Decision: Auto buy, notify, or skip
-                            if score >= analyzer_config.min_score_auto_buy {
+                            if combined_score >= analyzer_config.min_score_auto_buy {
                                 info!(
                                     mint = %token.mint,
                                     score = score,
@@ -287,8 +323,13 @@ async fn main() -> Result<()> {
                                     analyzer_config.min_score_auto_buy
                                 );
 
-                                // Entry confirmation check
-                                match confirm_entry(&token, &analyzer_config.jupiter_api_url, &EntryConfirmation::default()).await {
+                                // Entry confirmation check (skip delay for snipe mode)
+                                let entry_conf = if analyzer_config.trading_mode == crate::config::TradingMode::Snipe {
+                                    EntryConfirmation { delay_secs: 0, ..EntryConfirmation::default() }
+                                } else {
+                                    EntryConfirmation::default()
+                                };
+                                match confirm_entry(&token, &analyzer_config.jupiter_api_url, &entry_conf).await {
                                     Ok(EntryDecision::Proceed) => {
                                         // Confirmed — continue to buy
                                     }
@@ -410,7 +451,7 @@ async fn main() -> Result<()> {
                                         error!(error = %e, "Failed to get active wallet");
                                     }
                                 }
-                            } else if score >= analyzer_config.min_score_notify {
+                            } else if combined_score >= analyzer_config.min_score_notify {
                                 info!(
                                     mint = %token.mint,
                                     score = score,
@@ -447,8 +488,10 @@ async fn main() -> Result<()> {
                             } else {
                                 info!(
                                     mint = %token.mint,
-                                    score = score,
-                                    "Score < {} \u{2192} SKIP",
+                                    combined = combined_score,
+                                    security = score,
+                                    opportunity = opp_score,
+                                    "Combined score < {} \u{2192} SKIP",
                                     analyzer_config.min_score_notify
                                 );
                             }

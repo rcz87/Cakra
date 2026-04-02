@@ -388,7 +388,10 @@ async fn main() -> Result<()> {
     });
 
     // ── Spawn Price Feed ───────────────────────────────────────
-    let price_feed = PriceFeed::new(&config.jupiter_api_url, &config.jupiter_api_key, 3);
+    let price_rpc = Arc::new(solana_client::rpc_client::RpcClient::new(
+        config.effective_rpc_url().to_string(),
+    ));
+    let price_feed = PriceFeed::new(&config.jupiter_api_url, &config.jupiter_api_key, 3, price_rpc);
     let price_positions = position_manager.clone();
     let mut price_shutdown = shutdown_tx.subscribe();
     let price_handle = tokio::spawn(async move {

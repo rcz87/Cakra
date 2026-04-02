@@ -42,6 +42,11 @@ pub struct Config {
     pub min_score_auto_buy: u8,
     pub min_score_notify: u8,
 
+    // Position Management
+    /// Maximum hold time in seconds before force-selling profitable positions.
+    /// Default: 14400 (4 hours). Set to 0 to disable.
+    pub max_hold_secs: u64,
+
     // Network
     pub use_devnet: bool,
 }
@@ -115,6 +120,11 @@ impl Config {
                 .unwrap_or_else(|_| "50".to_string())
                 .parse()
                 .context("Invalid MIN_SCORE_NOTIFY")?,
+
+            max_hold_secs: env::var("MAX_HOLD_SECS")
+                .unwrap_or_else(|_| "14400".to_string())
+                .parse()
+                .context("Invalid MAX_HOLD_SECS")?,
 
             use_devnet: env::var("USE_DEVNET")
                 .unwrap_or_else(|_| "false".to_string())

@@ -182,10 +182,13 @@ impl ExecutorService {
             }
         }
 
+        // Fetch a fresh blockhash right before signing to avoid stale blockhash
+        // if the quote + swap-instructions steps took too long.
         let recent_blockhash = self
             .rpc
             .get_latest_blockhash()
             .context("Failed to get recent blockhash")?;
+        let blockhash_fetched = std::time::Instant::now();
 
         let swap_tx = Transaction::new_signed_with_payer(
             &instructions,
@@ -195,6 +198,14 @@ impl ExecutorService {
         );
 
         // 4. Submit via Jito bundle for MEV protection
+        let blockhash_age = blockhash_fetched.elapsed();
+        if blockhash_age.as_secs() >= 60 {
+            anyhow::bail!(
+                "Blockhash became stale before bundle submission (age: {}s). Aborting buy.",
+                blockhash_age.as_secs()
+            );
+        }
+
         let bundle_id = self
             .jito
             .submit_bundle(
@@ -472,10 +483,13 @@ impl ExecutorService {
             }
         }
 
+        // Fetch a fresh blockhash right before signing to avoid stale blockhash
+        // if the quote + swap-instructions steps took too long.
         let recent_blockhash = self
             .rpc
             .get_latest_blockhash()
             .context("Failed to get recent blockhash for sell")?;
+        let blockhash_fetched = std::time::Instant::now();
 
         let swap_tx = Transaction::new_signed_with_payer(
             &instructions,
@@ -485,6 +499,14 @@ impl ExecutorService {
         );
 
         // 4. Submit via Jito bundle
+        let blockhash_age = blockhash_fetched.elapsed();
+        if blockhash_age.as_secs() >= 60 {
+            anyhow::bail!(
+                "Blockhash became stale before sell bundle submission (age: {}s). Aborting sell.",
+                blockhash_age.as_secs()
+            );
+        }
+
         let bundle_id = self
             .jito
             .submit_bundle(

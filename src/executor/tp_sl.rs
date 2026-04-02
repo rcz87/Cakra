@@ -69,6 +69,13 @@ pub enum TpSlCommand {
         age_secs: u64,
         pnl_pct: f64,
     },
+    /// Max age exit — profitable position exceeded max hold time.
+    MaxAgeExit {
+        mint: String,
+        symbol: String,
+        age_secs: u64,
+        pnl_pct: f64,
+    },
 }
 
 /// Take-profit / stop-loss monitor that runs as a background tokio task.
@@ -229,6 +236,32 @@ impl TpSlMonitor {
 
             if let Err(e) = self.command_tx.send(cmd).await {
                 error!("Failed to send time stop command: {e}");
+            }
+            return;
+        }
+
+        // Max age exit: if position exceeds max hold time AND is profitable (>10%), force sell.
+        // This prevents indefinite holding of profitable positions that never hit TP tiers.
+        let max_hold = self.config.max_hold_secs;
+        if max_hold > 0 && pos.age_secs > max_hold && pos.pnl_pct > 10.0 {
+            warn!(
+                mint = %pos.token_mint,
+                symbol = %pos.token_symbol,
+                age_secs = pos.age_secs,
+                max_hold_secs = max_hold,
+                pnl_pct = pos.pnl_pct,
+                "Max age exit triggered — profitable position exceeded max hold time"
+            );
+
+            let cmd = TpSlCommand::MaxAgeExit {
+                mint: pos.token_mint.clone(),
+                symbol: pos.token_symbol.clone(),
+                age_secs: pos.age_secs,
+                pnl_pct: pos.pnl_pct,
+            };
+
+            if let Err(e) = self.command_tx.send(cmd).await {
+                error!("Failed to send max age exit command: {e}");
             }
             return;
         }
@@ -395,6 +428,17 @@ pub async fn process_tp_sl_commands(
                 );
                 if let Err(e) = sell_tx.send((mint, 100)).await {
                     error!("Failed to dispatch time stop sell: {e}");
+                }
+            }
+            TpSlCommand::MaxAgeExit { mint, symbol, age_secs, pnl_pct } => {
+                warn!(
+                    symbol = %symbol,
+                    age_secs = age_secs,
+                    pnl_pct = pnl_pct,
+                    "Processing max age exit: selling 100%"
+                );
+                if let Err(e) = sell_tx.send((mint, 100)).await {
+                    error!("Failed to dispatch max age exit sell: {e}");
                 }
             }
         }

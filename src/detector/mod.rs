@@ -49,18 +49,31 @@ impl DetectorService {
         let grpc_endpoint = self.config.grpc_endpoint.clone();
         let grpc_token = self.config.grpc_token.clone();
         let grpc_handle = tokio::spawn(async move {
+            let mut backoff_secs: u64 = 1;
+            const MAX_BACKOFF_SECS: u64 = 60;
+
             loop {
                 match grpc::start_grpc_listener(&grpc_endpoint, &grpc_token, raw_tx_sender.clone())
                     .await
                 {
                     Ok(()) => {
-                        warn!("gRPC listener exited, reconnecting in 5 seconds...");
+                        warn!(
+                            backoff_secs,
+                            "gRPC listener exited cleanly, reconnecting..."
+                        );
+                        // Successful run before exit — reset backoff
+                        backoff_secs = 1;
                     }
                     Err(e) => {
-                        error!(error = %e, "gRPC listener error, reconnecting in 5 seconds...");
+                        error!(
+                            error = %e,
+                            backoff_secs,
+                            "gRPC listener error, reconnecting after backoff"
+                        );
                     }
                 }
-                tokio::time::sleep(tokio::time::Duration::from_secs(5)).await;
+                tokio::time::sleep(tokio::time::Duration::from_secs(backoff_secs)).await;
+                backoff_secs = (backoff_secs * 2).min(MAX_BACKOFF_SECS);
             }
         });
 

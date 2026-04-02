@@ -149,9 +149,46 @@ async fn main() -> Result<()> {
         let tg_bot = teloxide::Bot::new(&analyzer_config.telegram_bot_token);
         let tg_chat = teloxide::types::ChatId(analyzer_config.telegram_admin_chat_id);
 
+        // Circuit breaker: track analyzer errors within a rolling window.
+        // If errors exceed the threshold, pause processing and alert.
+        const CB_ERROR_THRESHOLD: u32 = 5;
+        const CB_WINDOW: std::time::Duration = std::time::Duration::from_secs(60);
+        const CB_PAUSE: std::time::Duration = std::time::Duration::from_secs(30);
+
+        let mut error_timestamps: Vec<tokio::time::Instant> = Vec::new();
+
         loop {
             tokio::select! {
                 Some(token) = token_rx.recv() => {
+                    // ── Circuit breaker check ──────────────────────────────
+                    let now = tokio::time::Instant::now();
+                    error_timestamps.retain(|t| now.duration_since(*t) < CB_WINDOW);
+
+                    if error_timestamps.len() >= CB_ERROR_THRESHOLD as usize {
+                        warn!(
+                            errors_in_window = error_timestamps.len(),
+                            pause_secs = CB_PAUSE.as_secs(),
+                            "Circuit breaker OPEN — too many analyzer errors, pausing processing"
+                        );
+                        let _ = tg_bot.send_message(
+                            tg_chat,
+                            format!(
+                                "\u{1f6a8} <b>Circuit Breaker Triggered</b>\n\n\
+                                 \u{26a0}\u{fe0f} {} analyzer errors in {}s window.\n\
+                                 \u{23f8}\u{fe0f} Pausing token processing for {}s.\n\n\
+                                 <i>Bot will auto-resume. Check RPC/network health.</i>",
+                                error_timestamps.len(),
+                                CB_WINDOW.as_secs(),
+                                CB_PAUSE.as_secs(),
+                            ),
+                        ).parse_mode(teloxide::types::ParseMode::Html).await;
+
+                        tokio::time::sleep(CB_PAUSE).await;
+                        error_timestamps.clear();
+                        info!("Circuit breaker CLOSED — resuming token processing");
+                        continue;
+                    }
+
                     info!(
                         mint = %token.mint,
                         symbol = %token.symbol,
@@ -296,6 +333,7 @@ async fn main() -> Result<()> {
                                                             error = %e,
                                                             "AUTO BUY failed"
                                                         );
+                                                        error_timestamps.push(tokio::time::Instant::now());
 
                                                         let _ = tg_bot.send_message(
                                                             tg_chat,
@@ -376,6 +414,7 @@ async fn main() -> Result<()> {
                                 error = %e,
                                 "Security analysis failed"
                             );
+                            error_timestamps.push(tokio::time::Instant::now());
                         }
                     }
                 }

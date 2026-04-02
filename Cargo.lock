@@ -3724,6 +3724,7 @@ dependencies = [
  "solana-client",
  "solana-sdk",
  "solana-transaction-status",
+ "spl-associated-token-account",
  "spl-token 6.0.0",
  "teloxide",
  "thiserror 2.0.18",

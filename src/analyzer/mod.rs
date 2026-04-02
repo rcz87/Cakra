@@ -42,6 +42,66 @@ impl AnalyzerService {
         }
     }
 
+    /// Fast security filter for snipe mode (< 500ms target).
+    ///
+    /// Only runs on-chain checks: mint authority, freeze authority, creator basic.
+    /// Skips slow external API calls (GoPlus, RugCheck, honeypot, socials).
+    /// Returns a score based on available data — unscored fields default to neutral.
+    pub async fn analyze_token_fast(
+        &self,
+        token: &TokenInfo,
+        rpc_client: &RpcClient,
+    ) -> Result<SecurityAnalysis> {
+        info!(
+            mint = %token.mint,
+            symbol = %token.symbol,
+            "Starting FAST security filter (snipe mode)"
+        );
+
+        let mut analysis = SecurityAnalysis::default();
+
+        // --- Mint authority (on-chain, fast) ---
+        match check_mint_authority(rpc_client, &token.mint) {
+            Ok(renounced) => analysis.mint_renounced = renounced,
+            Err(e) => warn!(mint = %token.mint, err = %e, "Fast: mint authority failed"),
+        }
+
+        // --- Freeze authority (on-chain, fast) ---
+        match check_freeze_authority(rpc_client, &token.mint) {
+            Ok(null) => analysis.freeze_authority_null = null,
+            Err(e) => warn!(mint = %token.mint, err = %e, "Fast: freeze authority failed"),
+        }
+
+        // --- Creator history (cached, fast if cached) ---
+        match analyze_creator(rpc_client, &token.creator, &self.creator_cache).await {
+            Ok(history) => analysis.creator_history = history,
+            Err(e) => warn!(mint = %token.mint, err = %e, "Fast: creator check failed"),
+        }
+
+        // --- LP status (on-chain, fast) ---
+        if let Some(ref pool_address) = token.pool_address {
+            match check_lp_status(rpc_client, pool_address) {
+                Ok(status) => analysis.lp_status = status,
+                Err(e) => warn!(mint = %token.mint, err = %e, "Fast: LP check failed"),
+            }
+        }
+
+        // Score with partial data (unset fields = 0, which penalizes unknown)
+        analysis.final_score = calculate_score(
+            &analysis,
+            token.initial_liquidity_usd,
+            token.initial_liquidity_sol,
+        );
+
+        info!(
+            mint = %token.mint,
+            score = analysis.final_score,
+            "FAST security filter complete"
+        );
+
+        Ok(analysis)
+    }
+
     /// Run every security check against the given token and compute the final score.
     pub async fn analyze_token(
         &self,
@@ -165,7 +225,11 @@ impl AnalyzerService {
         }
 
         // --- Final score ---
-        analysis.final_score = calculate_score(&analysis, token.initial_liquidity_usd);
+        analysis.final_score = calculate_score(
+            &analysis,
+            token.initial_liquidity_usd,
+            token.initial_liquidity_sol,
+        );
         info!(
             mint = %token.mint,
             score = analysis.final_score,

@@ -107,6 +107,38 @@ async fn main() -> Result<()> {
         WalletManager::new(&config, db.clone()).expect("Failed to create wallet manager"),
     );
 
+    // ── Verify wallet decrypt works BEFORE starting trading ───────
+    match wallet_manager.get_active_wallet() {
+        Ok(Some(active)) => {
+            match wallet_manager.get_keypair(&active.pubkey, &wallet_password) {
+                Ok(_kp) => {
+                    info!(
+                        pubkey = %active.pubkey,
+                        "Wallet decrypt verified — sell will work"
+                    );
+                }
+                Err(e) => {
+                    panic!(
+                        "FATAL: Active wallet '{}' cannot be decrypted: {}. \
+                         Bot CANNOT sell positions. Fix WALLET_PASSWORD before starting.",
+                        active.pubkey, e
+                    );
+                }
+            }
+        }
+        Ok(None) => {
+            warn!(
+                "No active wallet set. Bot will detect and analyze tokens, \
+                 but CANNOT buy or sell until a wallet is activated via /wallet."
+            );
+        }
+        Err(e) => {
+            panic!(
+                "FATAL: Cannot query wallets: {}. Fix database before starting.", e
+            );
+        }
+    }
+
     let executor = Arc::new(ExecutorService::new(
         Arc::new(config.clone()),
         db.clone(),
@@ -496,6 +528,8 @@ async fn main() -> Result<()> {
     let sell_executor = executor.clone();
     let sell_wallet = wallet_manager.clone();
     let sell_password = wallet_password.clone();
+    let sell_tg_bot = teloxide::Bot::new(&config.telegram_bot_token);
+    let sell_tg_chat = teloxide::types::ChatId(config.telegram_admin_chat_id);
     let sell_handle = tokio::spawn(async move {
         info!("Sell executor starting...");
         while let Some((mint, sell_pct)) = sell_rx.recv().await {
@@ -506,37 +540,104 @@ async fn main() -> Result<()> {
                 Ok(Some(active)) => match sell_wallet.get_keypair(&active.pubkey, &sell_password) {
                     Ok(kp) => kp,
                     Err(e) => {
-                        error!(error = %e, "Failed to decrypt wallet for sell");
+                        error!(error = %e, mint = %mint, "CRITICAL: Failed to decrypt wallet for sell");
+                        let _ = sell_tg_bot.send_message(
+                            sell_tg_chat,
+                            format!(
+                                "\u{1f6a8} <b>CRITICAL: Sell GAGAL — wallet decrypt error</b>\n\n\
+                                 \u{274c} Mint: <code>{}</code>\n\
+                                 \u{26a0}\u{fe0f} Error: {}\n\n\
+                                 <b>Posisi TIDAK bisa dijual otomatis!</b>\n\
+                                 Segera jual manual atau fix WALLET_PASSWORD.",
+                                mint, e
+                            ),
+                        ).parse_mode(teloxide::types::ParseMode::Html).await;
                         continue;
                     }
                 },
                 Ok(None) => {
-                    warn!("No active wallet set — cannot execute sell");
+                    error!(mint = %mint, "CRITICAL: No active wallet — cannot sell");
+                    let _ = sell_tg_bot.send_message(
+                        sell_tg_chat,
+                        format!(
+                            "\u{1f6a8} <b>CRITICAL: Sell GAGAL — no active wallet</b>\n\n\
+                             \u{274c} Mint: <code>{}</code>\n\n\
+                             <b>Set wallet aktif via /wallet segera!</b>",
+                            mint
+                        ),
+                    ).parse_mode(teloxide::types::ParseMode::Html).await;
                     continue;
                 }
                 Err(e) => {
-                    error!(error = %e, "Failed to get active wallet for sell");
+                    error!(error = %e, mint = %mint, "CRITICAL: Failed to get wallet for sell");
+                    let _ = sell_tg_bot.send_message(
+                        sell_tg_chat,
+                        format!(
+                            "\u{1f6a8} <b>CRITICAL: Sell GAGAL — wallet error</b>\n\n\
+                             \u{274c} Mint: <code>{}</code>\n\
+                             \u{26a0}\u{fe0f} Error: {}",
+                            mint, e
+                        ),
+                    ).parse_mode(teloxide::types::ParseMode::Html).await;
                     continue;
                 }
             };
 
-            match sell_executor.execute_sell(&mint, sell_pct, &keypair).await {
-                Ok(sig) => {
-                    info!(
+            // Retry sell up to 3 times with backoff on failure
+            let mut sell_ok = false;
+            for attempt in 0..3u32 {
+                if attempt > 0 {
+                    let delay = std::time::Duration::from_secs(1 << attempt);
+                    warn!(
                         mint = %mint,
-                        sell_pct = sell_pct,
-                        signature = %sig,
-                        "Sell executed successfully"
+                        attempt = attempt + 1,
+                        delay_secs = delay.as_secs(),
+                        "Retrying sell..."
                     );
+                    tokio::time::sleep(delay).await;
                 }
-                Err(e) => {
-                    error!(
-                        mint = %mint,
-                        sell_pct = sell_pct,
-                        error = %e,
-                        "Sell execution failed"
-                    );
+
+                match sell_executor.execute_sell(&mint, sell_pct, &keypair).await {
+                    Ok(sig) => {
+                        info!(
+                            mint = %mint,
+                            sell_pct = sell_pct,
+                            signature = %sig,
+                            "Sell executed successfully"
+                        );
+                        sell_ok = true;
+                        break;
+                    }
+                    Err(e) => {
+                        error!(
+                            mint = %mint,
+                            sell_pct = sell_pct,
+                            attempt = attempt + 1,
+                            error = %e,
+                            "Sell execution failed"
+                        );
+                    }
                 }
+            }
+
+            if !sell_ok {
+                // All 3 retries failed — emergency Telegram alert
+                error!(
+                    mint = %mint,
+                    sell_pct = sell_pct,
+                    "CRITICAL: Sell failed after 3 retries"
+                );
+                let _ = sell_tg_bot.send_message(
+                    sell_tg_chat,
+                    format!(
+                        "\u{1f6a8} <b>CRITICAL: Sell GAGAL 3x</b>\n\n\
+                         \u{274c} Mint: <code>{}</code>\n\
+                         \u{1f4ca} Sell %: {}%\n\n\
+                         <b>Bot tidak bisa jual posisi ini!</b>\n\
+                         Segera jual manual via /sell {}",
+                        mint, sell_pct, mint
+                    ),
+                ).parse_mode(teloxide::types::ParseMode::Html).await;
             }
         }
     });

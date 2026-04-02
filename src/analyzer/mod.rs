@@ -24,7 +24,7 @@ use self::honeypot::simulate_honeypot;
 use self::liquidity::check_lp_status;
 use self::metadata::check_metadata_immutable;
 use self::rugcheck::check_rugcheck;
-use self::scoring::calculate_score;
+use self::scoring::{calculate_score, calculate_score_fast};
 use self::socials::check_socials;
 
 /// Central analyzer service for RICOZ SNIPER.
@@ -86,8 +86,8 @@ impl AnalyzerService {
             }
         }
 
-        // Score with partial data (unset fields = 0, which penalizes unknown)
-        analysis.final_score = calculate_score(
+        // Score using only checked fields — don't penalize unknown/unchecked data
+        analysis.final_score = calculate_score_fast(
             &analysis,
             token.initial_liquidity_usd,
             token.initial_liquidity_sol,

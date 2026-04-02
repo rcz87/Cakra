@@ -123,6 +123,78 @@ pub fn calculate_score(
     final_score
 }
 
+/// Fast-mode score: only weights fields that were actually checked.
+///
+/// In fast mode, only mint_renounced, freeze_authority, creator, LP, and
+/// liquidity are checked. The score is normalized over those weights only,
+/// so unchecked fields don't drag the score to zero.
+pub fn calculate_score_fast(
+    analysis: &SecurityAnalysis,
+    initial_liquidity_usd: f64,
+    initial_liquidity_sol: f64,
+) -> u8 {
+    let effective_liquidity_usd = if initial_liquidity_usd > 0.0 {
+        initial_liquidity_usd
+    } else if initial_liquidity_sol > 0.0 {
+        initial_liquidity_sol * 100.0
+    } else {
+        0.0
+    };
+
+    // Only score fields that fast analyzer actually checks
+    let mint_score = if analysis.mint_renounced { 100.0 } else { 0.0 };
+    let freeze_score = if analysis.freeze_authority_null { 100.0 } else { 0.0 };
+    let creator_score = match analysis.creator_history {
+        CreatorHistory::Clean { .. } => 100.0,
+        CreatorHistory::Suspicious { .. } => 30.0,
+        CreatorHistory::Rugger { .. } => 0.0,
+        CreatorHistory::Unknown => 50.0, // neutral for fast mode, not punitive
+    };
+    let lp_score = match analysis.lp_status {
+        LpStatus::Burned => 100.0,
+        LpStatus::Locked => 80.0,
+        LpStatus::NotBurned => 20.0, // not zero — PumpFun tokens often don't lock LP
+        LpStatus::Unknown => 40.0,   // neutral, not punitive
+    };
+    let liquidity_score = if effective_liquidity_usd >= 10_000.0 {
+        100.0
+    } else if effective_liquidity_usd >= 1_000.0 {
+        50.0
+    } else if effective_liquidity_usd >= 200.0 {
+        25.0 // low but not zero for new tokens
+    } else {
+        0.0
+    };
+
+    // Weights for checked fields only (sum = 100)
+    const W_MINT: f64 = 25.0;
+    const W_FREEZE: f64 = 25.0;
+    const W_CREATOR: f64 = 20.0;
+    const W_LP: f64 = 15.0;
+    const W_LIQ: f64 = 15.0;
+
+    let weighted = (mint_score * W_MINT
+        + freeze_score * W_FREEZE
+        + creator_score * W_CREATOR
+        + lp_score * W_LP
+        + liquidity_score * W_LIQ)
+        / 100.0;
+
+    let final_score = weighted.round().clamp(0.0, 100.0) as u8;
+
+    info!(
+        final_score,
+        mint_score,
+        freeze_score,
+        creator_score,
+        lp_score,
+        liquidity_score,
+        "Fast score calculated (checked fields only)"
+    );
+
+    final_score
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -1,5 +1,78 @@
 use anyhow::{Context, Result};
 use std::env;
+use std::fmt;
+
+/// Trading mode determines TP/SL thresholds, timing, and exit behavior.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TradingMode {
+    /// Fast in/out for new tokens. Tight TP/SL, fast exits.
+    Scalp,
+    /// Hold for established/liquid tokens. Wide TP tiers, longer holds.
+    Hold,
+}
+
+impl fmt::Display for TradingMode {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            TradingMode::Scalp => write!(f, "scalp"),
+            TradingMode::Hold => write!(f, "hold"),
+        }
+    }
+}
+
+/// Mode-specific trading parameters derived from TradingMode.
+#[derive(Debug, Clone)]
+pub struct TradingProfile {
+    pub mode: TradingMode,
+    // TP/SL defaults for new positions
+    pub take_profit_pct: f64,
+    pub stop_loss_pct: f64,
+    pub trailing_stop_pct: f64,
+    // Trailing stop only activates after this PnL %
+    pub trailing_gate_pct: f64,
+    // Time stop: exit if position age > time_stop_secs AND PnL < time_stop_min_pnl
+    pub time_stop_secs: u64,
+    pub time_stop_min_pnl: f64,
+    // Max age exit: force sell if age > max_hold AND PnL > max_age_min_pnl
+    pub max_hold_secs: u64,
+    pub max_age_min_pnl: f64,
+    // Intervals
+    pub price_poll_secs: u64,
+    pub tpsl_check_secs: u64,
+}
+
+impl TradingProfile {
+    pub fn from_mode(mode: TradingMode, max_hold_override: u64) -> Self {
+        match mode {
+            TradingMode::Scalp => Self {
+                mode,
+                take_profit_pct: 20.0,
+                stop_loss_pct: 10.0,
+                trailing_stop_pct: 5.0,
+                trailing_gate_pct: 10.0,
+                time_stop_secs: 120,       // 2 menit
+                time_stop_min_pnl: 3.0,    // exit jika PnL < 3% setelah 2 min
+                max_hold_secs: if max_hold_override > 0 { max_hold_override } else { 600 }, // 10 min
+                max_age_min_pnl: 5.0,
+                price_poll_secs: 1,
+                tpsl_check_secs: 1,
+            },
+            TradingMode::Hold => Self {
+                mode,
+                take_profit_pct: 100.0,
+                stop_loss_pct: 50.0,
+                trailing_stop_pct: 30.0,
+                trailing_gate_pct: 30.0,
+                time_stop_secs: 600,       // 10 menit
+                time_stop_min_pnl: 10.0,
+                max_hold_secs: if max_hold_override > 0 { max_hold_override } else { 14400 }, // 4 jam
+                max_age_min_pnl: 10.0,
+                price_poll_secs: 3,
+                tpsl_check_secs: 3,
+            },
+        }
+    }
+}
 
 #[derive(Debug, Clone)]
 pub struct Config {
@@ -43,9 +116,12 @@ pub struct Config {
     pub min_score_notify: u8,
 
     // Position Management
-    /// Maximum hold time in seconds before force-selling profitable positions.
-    /// Default: 14400 (4 hours). Set to 0 to disable.
+    /// Maximum hold time in seconds. Overrides mode default if > 0.
     pub max_hold_secs: u64,
+
+    // Trading Mode
+    /// "scalp" for fast in/out on new tokens, "hold" for liquid tokens.
+    pub trading_mode: TradingMode,
 
     // Network
     pub use_devnet: bool,
@@ -122,15 +198,32 @@ impl Config {
                 .context("Invalid MIN_SCORE_NOTIFY")?,
 
             max_hold_secs: env::var("MAX_HOLD_SECS")
-                .unwrap_or_else(|_| "14400".to_string())
+                .unwrap_or_else(|_| "0".to_string())
                 .parse()
                 .context("Invalid MAX_HOLD_SECS")?,
+
+            trading_mode: match env::var("TRADING_MODE")
+                .unwrap_or_else(|_| "hold".to_string())
+                .to_lowercase()
+                .as_str()
+            {
+                "scalp" => TradingMode::Scalp,
+                "hold" => TradingMode::Hold,
+                other => anyhow::bail!(
+                    "Invalid TRADING_MODE '{}': must be 'scalp' or 'hold'",
+                    other
+                ),
+            },
 
             use_devnet: env::var("USE_DEVNET")
                 .unwrap_or_else(|_| "false".to_string())
                 .parse()
                 .context("Invalid USE_DEVNET")?,
         })
+    }
+
+    pub fn trading_profile(&self) -> TradingProfile {
+        TradingProfile::from_mode(self.trading_mode, self.max_hold_secs)
     }
 
     pub fn effective_rpc_url(&self) -> &str {

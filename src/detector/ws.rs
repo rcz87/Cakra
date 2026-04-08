@@ -179,10 +179,18 @@ async fn subscribe_program_logs(
             };
 
             // Brief delay for tx to be confirmed
-            tokio::time::sleep(std::time::Duration::from_millis(800)).await;
+            tokio::time::sleep(std::time::Duration::from_millis(500)).await;
 
             match fetch_and_parse_transaction(&rpc, &signature).await {
                 Ok(raw_txs) => {
+                    if !raw_txs.is_empty() {
+                        debug!(
+                            sig = %signature,
+                            count = raw_txs.len(),
+                            program = %raw_txs[0].program_id,
+                            "Parsed transaction into RawTransactions"
+                        );
+                    }
                     for raw_tx in raw_txs {
                         if let Err(e) = tx_sender.send(raw_tx).await {
                             warn!(error = %e, "Failed to send WS-detected transaction");

@@ -17,7 +17,8 @@ const HIGH_TAX_THRESHOLD: f64 = 10.0;
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct JupiterQuote {
-    in_amount: String,
+    #[serde(alias = "inAmount")]
+    _in_amount: String,
     out_amount: String,
 }
 

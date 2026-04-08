@@ -36,14 +36,13 @@ struct BundleStatusEntry {
 /// Result of a bundle confirmation poll.
 #[derive(Debug, Clone)]
 pub enum BundleConfirmation {
-    /// Bundle landed on-chain at the given slot.
+    /// Bundle landed on-chain.
     Landed {
-        slot: Option<u64>,
         /// Transaction signatures from the bundle (first = swap tx, last = tip tx).
         transactions: Vec<String>,
     },
     /// Bundle was explicitly rejected by the block engine.
-    Failed { status: String },
+    Failed,
     /// Polling timed out without a terminal status.
     Timeout,
 }
@@ -123,13 +122,6 @@ impl JitoClient {
                 .build()
                 .expect("Failed to build Jito HTTP client"),
         }
-    }
-
-    /// Pick a random Jito tip account and build a SOL transfer instruction to it.
-    pub fn build_tip_instruction(_payer: &Pubkey, _tip_lamports: u64) -> Result<()> {
-        // Kept for backward compat — use build_tip_tx() instead.
-        let _ = Self::random_tip_account()?;
-        Ok(())
     }
 
     /// Build a standalone tip transaction that transfers SOL to a random Jito tip account.
@@ -308,7 +300,6 @@ impl JitoClient {
                                                 "Bundle confirmed on-chain"
                                             );
                                             return Ok(BundleConfirmation::Landed {
-                                                slot: entry.landed_slot,
                                                 transactions: txs,
                                             });
                                         }
@@ -319,9 +310,7 @@ impl JitoClient {
                                                 attempts = attempts,
                                                 "Bundle rejected by block engine"
                                             );
-                                            return Ok(BundleConfirmation::Failed {
-                                                status: entry.status.clone(),
-                                            });
+                                            return Ok(BundleConfirmation::Failed);
                                         }
                                         other => {
                                             debug!(

@@ -22,7 +22,6 @@ pub struct Route {
     pub expected_output: u64,
     pub min_output: u64,
     pub price_impact_pct: f64,
-    pub estimated_fee_lamports: u64,
 }
 
 /// Result of comparing a single route source.
@@ -96,7 +95,6 @@ pub async fn find_best_route(
                     expected_output: candidate.expected_output,
                     min_output,
                     price_impact_pct: candidate.price_impact,
-                    estimated_fee_lamports: 0,
                 };
                 info!(
                     route = ?route.route_type,
@@ -138,7 +136,6 @@ pub async fn find_best_route(
                     expected_output: candidate.expected_output,
                     min_output,
                     price_impact_pct: candidate.price_impact,
-                    estimated_fee_lamports: 0,
                 };
 
                 info!(
@@ -184,7 +181,6 @@ pub async fn find_best_route(
                     expected_output: candidate.expected_output,
                     min_output,
                     price_impact_pct: candidate.price_impact,
-                    estimated_fee_lamports: 0,
                 };
 
                 info!(

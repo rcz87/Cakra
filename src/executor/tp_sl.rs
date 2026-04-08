@@ -81,12 +81,6 @@ pub enum TpSlCommand {
         sell_pct: u8,
         tier_index: usize,
     },
-    /// Emergency exit due to liquidity removal.
-    EmergencyExit {
-        mint: String,
-        symbol: String,
-        reason: String,
-    },
     /// Time stop — position has been open too long without sufficient profit.
     TimeStop {
         mint: String,
@@ -108,7 +102,6 @@ pub enum TpSlCommand {
 /// Periodically checks open positions and sends sell commands when
 /// TP, SL, or trailing stop conditions are met.
 pub struct TpSlMonitor {
-    config: Arc<Config>,
     profile: TradingProfile,
     positions: PositionManager,
     command_tx: mpsc::Sender<TpSlCommand>,
@@ -143,7 +136,6 @@ impl TpSlMonitor {
             "TpSlMonitor configured"
         );
         Self {
-            config,
             profile,
             positions,
             command_tx,
@@ -451,16 +443,6 @@ pub async fn process_tp_sl_commands(
                 );
                 if let Err(e) = sell_tx.send((mint, sell_pct)).await {
                     error!("Failed to dispatch partial TP sell: {e}");
-                }
-            }
-            TpSlCommand::EmergencyExit { mint, symbol, reason } => {
-                error!(
-                    symbol = %symbol,
-                    reason = %reason,
-                    "Processing emergency exit: selling 100%"
-                );
-                if let Err(e) = sell_tx.send((mint, 100)).await {
-                    error!("Failed to dispatch emergency exit sell: {e}");
                 }
             }
             TpSlCommand::TimeStop { mint, symbol, age_secs, pnl_pct } => {

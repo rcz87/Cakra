@@ -213,13 +213,6 @@ impl SolTrendTracker {
     }
 }
 
-/// Fetch SOL/USD price trend (1h change percentage).
-/// Uses Jupiter price API and the provided tracker for historical samples.
-pub async fn get_sol_trend_1h(tracker: &SolTrendTracker) -> Result<f64> {
-    tracker.fetch_and_record().await?;
-    Ok(tracker.get_1h_change_pct())
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;

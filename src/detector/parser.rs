@@ -1,48 +1,13 @@
 use anyhow::{Context, Result};
-use serde::Deserialize;
 
 /// Raw transaction data received from gRPC or other sources.
 #[derive(Debug, Clone)]
 pub struct RawTransaction {
-    pub signature: String,
+    pub _signature: String,
     pub program_id: String,
     pub data: Vec<u8>,
     pub accounts: Vec<String>,
-    pub slot: u64,
-}
-
-/// Token metadata fetched from a metadata URI (Metaplex standard).
-#[derive(Debug, Clone, Deserialize)]
-pub struct TokenMetadataJson {
-    pub name: Option<String>,
-    pub symbol: Option<String>,
-    pub description: Option<String>,
-    pub image: Option<String>,
-}
-
-/// Decode a base58-encoded string into bytes.
-pub fn decode_base58(encoded: &str) -> Result<Vec<u8>> {
-    bs58::decode(encoded)
-        .into_vec()
-        .context("Failed to decode base58 string")
-}
-
-/// Encode bytes as a base58 string.
-pub fn encode_base58(data: &[u8]) -> String {
-    bs58::encode(data).into_string()
-}
-
-/// Extract a 32-byte public key from a byte slice at a given offset and return as base58.
-pub fn extract_pubkey(data: &[u8], offset: usize) -> Result<String> {
-    if data.len() < offset + 32 {
-        anyhow::bail!(
-            "Data too short to extract pubkey at offset {}: need {} bytes, got {}",
-            offset,
-            offset + 32,
-            data.len()
-        );
-    }
-    Ok(encode_base58(&data[offset..offset + 32]))
+    pub _slot: u64,
 }
 
 /// Extract a u64 value (little-endian) from a byte slice at a given offset.
@@ -86,20 +51,3 @@ pub fn extract_length_prefixed_string(data: &[u8], offset: usize) -> Result<(Str
     Ok((s, 4 + len))
 }
 
-/// Fetch token metadata JSON from a URI.
-pub async fn fetch_token_metadata(uri: &str) -> Result<TokenMetadataJson> {
-    let client = reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(10))
-        .build()?;
-
-    let metadata: TokenMetadataJson = client
-        .get(uri)
-        .send()
-        .await
-        .context("Failed to fetch metadata URI")?
-        .json()
-        .await
-        .context("Failed to parse metadata JSON")?;
-
-    Ok(metadata)
-}

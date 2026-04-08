@@ -151,9 +151,4 @@ impl WalletManager {
         Ok(lamports as f64 / LAMPORTS_PER_SOL as f64)
     }
 
-    /// Delete a wallet by its database ID.
-    pub fn delete_wallet(&self, wallet_id: i64) -> Result<()> {
-        db::queries::delete_wallet(&self.db, wallet_id)
-            .context("Failed to delete wallet")
-    }
 }

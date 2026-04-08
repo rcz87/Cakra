@@ -44,15 +44,6 @@ impl DeduplicationQueue {
             .retain(|_, inserted_at| now.duration_since(*inserted_at) < self.ttl);
     }
 
-    /// Return the number of active (non-expired) entries.
-    pub fn len(&self) -> usize {
-        self.entries.len()
-    }
-
-    /// Check if the queue is empty.
-    pub fn is_empty(&self) -> bool {
-        self.entries.is_empty()
-    }
 }
 
 #[cfg(test)]
@@ -82,6 +73,6 @@ mod tests {
             Instant::now() - Duration::from_secs(1),
         );
         queue.cleanup();
-        assert!(queue.is_empty());
+        assert!(queue.entries.is_empty());
     }
 }

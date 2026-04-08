@@ -167,7 +167,7 @@ impl ExecutorService {
                 )?;
                 let token_program: Pubkey = "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA"
                     .parse().unwrap();
-                let ata_program: Pubkey = "ATokenGPvbdGVxr1b2hvZbsiqW5xWH25efTNsLJA8knL"
+                let _ata_program: Pubkey = "ATokenGPvbdGVxr1b2hvZbsiqW5xWH25efTNsLJA8knL"
                     .parse().unwrap();
 
                 // Create ATA instruction (idempotent — will succeed even if ATA exists)

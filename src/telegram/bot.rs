@@ -483,11 +483,6 @@ Atur TP/SL, slippage, max buy,\ndan parameter lainnya.\n\n\
                         }
                     }
                 }
-                let short = if pubkey.len() > 10 {
-                    format!("{}...{}", &pubkey[..6], &pubkey[pubkey.len()-4..])
-                } else {
-                    pubkey.clone()
-                };
                 let text = format!(
                     "\u{2705} <b>Wallet Created!</b>\n\
                      \u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\n\n\

@@ -43,9 +43,6 @@ impl CreatorCache {
     }
 }
 
-/// The SPL Token program ID.
-const TOKEN_PROGRAM_ID: &str = "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA";
-
 /// Minimum number of rugs to classify creator as a serial rugger.
 const RUG_THRESHOLD: u32 = 2;
 

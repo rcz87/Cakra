@@ -20,6 +20,7 @@ pub struct PositionManager {
     profile: TradingProfile,
 }
 
+#[allow(dead_code)]
 impl PositionManager {
     pub fn new(db: DbPool, profile: TradingProfile) -> Self {
         Self {

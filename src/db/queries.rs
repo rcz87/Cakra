@@ -39,12 +39,6 @@ pub fn set_active_wallet(db: &DbPool, wallet_id: i64) -> Result<()> {
     Ok(())
 }
 
-pub fn delete_wallet(db: &DbPool, wallet_id: i64) -> Result<()> {
-    let conn = db.lock().unwrap();
-    conn.execute("DELETE FROM wallets WHERE id = ?1", params![wallet_id])?;
-    Ok(())
-}
-
 // ── Token Queries ──
 
 pub fn insert_token(db: &DbPool, token: &TokenInfo) -> Result<()> {
@@ -89,15 +83,6 @@ pub fn is_blacklisted(db: &DbPool, mint: &str) -> Result<bool> {
     Ok(count > 0)
 }
 
-pub fn add_blacklist(db: &DbPool, mint: &str, reason: Option<&str>) -> Result<()> {
-    let conn = db.lock().unwrap();
-    conn.execute(
-        "INSERT OR REPLACE INTO blacklist (mint, reason) VALUES (?1, ?2)",
-        params![mint, reason],
-    )?;
-    Ok(())
-}
-
 // ── Trade Queries ──
 
 pub fn insert_trade(db: &DbPool, trade: &Trade) -> Result<()> {
@@ -132,15 +117,6 @@ pub fn insert_trade(db: &DbPool, trade: &Trade) -> Result<()> {
             trade.pnl_sol,
             trade.security_score,
         ],
-    )?;
-    Ok(())
-}
-
-pub fn update_trade_status(db: &DbPool, trade_id: &str, status: &str, tx_sig: Option<&str>) -> Result<()> {
-    let conn = db.lock().unwrap();
-    conn.execute(
-        "UPDATE trades SET status = ?1, tx_signature = ?2, confirmed_at = datetime('now') WHERE id = ?3",
-        params![status, tx_sig, trade_id],
     )?;
     Ok(())
 }
@@ -223,32 +199,6 @@ pub fn get_daily_pnl(db: &DbPool) -> Result<f64> {
 
 // ── Position Queries ──
 
-pub fn insert_position(db: &DbPool, pos: &Position) -> Result<()> {
-    let conn = db.lock().unwrap();
-    let status = match pos.status {
-        crate::models::position::PositionStatus::Open => "Open",
-        crate::models::position::PositionStatus::ClosedTp => "ClosedTp",
-        crate::models::position::PositionStatus::ClosedSl => "ClosedSl",
-        crate::models::position::PositionStatus::ClosedManual => "ClosedManual",
-        crate::models::position::PositionStatus::ClosedError => "ClosedError",
-    };
-    conn.execute(
-        "INSERT INTO positions (id, token_mint, token_symbol, wallet_pubkey, entry_price_sol, entry_amount_sol, token_amount, current_price_sol, highest_price_sol, take_profit_pct, stop_loss_pct, trailing_stop_pct, pnl_sol, pnl_pct, status, buy_tx, sell_tx, opened_at, closed_at)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19)",
-        params![
-            pos.id, pos.token_mint, pos.token_symbol, pos.wallet_pubkey,
-            pos.entry_price_sol, pos.entry_amount_sol, pos.token_amount,
-            pos.current_price_sol, pos.highest_price_sol,
-            pos.take_profit_pct, pos.stop_loss_pct, pos.trailing_stop_pct,
-            pos.pnl_sol, pos.pnl_pct, status,
-            pos.buy_tx, pos.sell_tx,
-            pos.opened_at.to_rfc3339(),
-            pos.closed_at.map(|t| t.to_rfc3339()),
-        ],
-    )?;
-    Ok(())
-}
-
 pub fn get_open_positions(db: &DbPool) -> Result<Vec<Position>> {
     let conn = db.lock().unwrap();
     let mut stmt = conn.prepare(
@@ -306,15 +256,6 @@ fn parse_position_status(s: &str) -> crate::models::position::PositionStatus {
         "ClosedError" => PositionStatus::ClosedError,
         _ => PositionStatus::Open, // fallback
     }
-}
-
-pub fn close_position(db: &DbPool, position_id: &str, status: &str, sell_tx: &str, pnl_sol: f64) -> Result<()> {
-    let conn = db.lock().unwrap();
-    conn.execute(
-        "UPDATE positions SET status = ?1, sell_tx = ?2, pnl_sol = ?3, closed_at = datetime('now') WHERE id = ?4",
-        params![status, sell_tx, pnl_sol, position_id],
-    )?;
-    Ok(())
 }
 
 // ── Settings Queries ──

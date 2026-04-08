@@ -25,9 +25,6 @@ const TOKEN_PROGRAM: &str = "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA";
 /// Associated Token Account program
 const ASSOCIATED_TOKEN_PROGRAM: &str = "ATokenGPvbdGVxr1b2hvZbsiqW5xWH25efTNsLJA8knL";
 
-/// System program rent sysvar
-const RENT_SYSVAR: &str = "SysvarRent111111111111111111111111111111111";
-
 /// Buy instruction discriminator for Pump.fun (first 8 bytes of sha256("global:buy"))
 const BUY_DISCRIMINATOR: [u8; 8] = [0x66, 0x06, 0x3d, 0x12, 0x01, 0xda, 0xeb, 0xea];
 
@@ -188,48 +185,3 @@ pub fn build_pumpfun_buy(
     })
 }
 
-/// Build a Pump.fun bonding curve sell instruction.
-pub fn build_pumpfun_sell(
-    mint: &Pubkey,
-    token_amount: u64,
-    min_sol_output: u64,
-    seller: &Pubkey,
-) -> Result<Instruction> {
-    let program_id: Pubkey = PUMPFUN_PROGRAM.parse()?;
-    let global: Pubkey = PUMPFUN_GLOBAL.parse()?;
-    let fee_recipient: Pubkey = PUMPFUN_FEE_RECIPIENT.parse()?;
-    let event_authority: Pubkey = PUMPFUN_EVENT_AUTHORITY.parse()?;
-    let token_program: Pubkey = TOKEN_PROGRAM.parse()?;
-
-    let (bonding_curve, _) = derive_bonding_curve(mint)?;
-    let bonding_curve_ata = derive_bonding_curve_token_account(&bonding_curve, mint)?;
-    let seller_ata = derive_buyer_token_account(seller, mint)?;
-
-    // Sell discriminator: first 8 bytes of sha256("global:sell")
-    let sell_discriminator: [u8; 8] = [0x33, 0xe6, 0x85, 0xa4, 0x01, 0x7f, 0x83, 0xad];
-
-    let mut data = Vec::with_capacity(24);
-    data.extend_from_slice(&sell_discriminator);
-    data.extend_from_slice(&token_amount.to_le_bytes());
-    data.extend_from_slice(&min_sol_output.to_le_bytes());
-
-    let accounts = vec![
-        AccountMeta::new_readonly(global, false),
-        AccountMeta::new(fee_recipient, false),
-        AccountMeta::new_readonly(*mint, false),
-        AccountMeta::new(bonding_curve, false),
-        AccountMeta::new(bonding_curve_ata, false),
-        AccountMeta::new(seller_ata, false),
-        AccountMeta::new(*seller, true),
-        AccountMeta::new_readonly(system_program::id(), false),
-        AccountMeta::new_readonly(token_program, false),
-        AccountMeta::new_readonly(event_authority, false),
-        AccountMeta::new_readonly(program_id, false),
-    ];
-
-    Ok(Instruction {
-        program_id,
-        accounts,
-        data,
-    })
-}

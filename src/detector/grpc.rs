@@ -169,11 +169,11 @@ async fn process_grpc_update(
                 .collect();
 
             let raw_tx = RawTransaction {
-                signature: signature.clone(),
+                _signature: signature.clone(),
                 program_id,
                 data: instruction.data.clone(),
                 accounts: instruction_accounts,
-                slot,
+                _slot: slot,
             };
 
             if let Err(e) = tx_sender.send(raw_tx).await {
@@ -206,11 +206,11 @@ async fn process_grpc_update(
                         .collect();
 
                     let raw_tx = RawTransaction {
-                        signature: signature.clone(),
+                        _signature: signature.clone(),
                         program_id,
                         data: inner_ix.data.clone(),
                         accounts: instruction_accounts,
-                        slot,
+                        _slot: slot,
                     };
 
                     if let Err(e) = tx_sender.send(raw_tx).await {

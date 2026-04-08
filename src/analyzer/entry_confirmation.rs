@@ -7,18 +7,12 @@ use crate::models::token::{TokenInfo, TokenSource};
 pub struct EntryConfirmation {
     /// Delay in seconds before buying (wait for initial activity).
     pub delay_secs: u64,
-    /// Minimum liquidity (SOL) that must remain after delay.
-    pub min_liquidity_sol: f64,
-    /// Maximum price drop (%) from detection to allow entry.
-    pub max_price_drop_pct: f64,
 }
 
 impl Default for EntryConfirmation {
     fn default() -> Self {
         Self {
             delay_secs: 3,
-            min_liquidity_sol: 1.0,
-            max_price_drop_pct: 50.0,
         }
     }
 }

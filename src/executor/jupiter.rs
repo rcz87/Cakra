@@ -252,23 +252,4 @@ impl JupiterClient {
         Ok(quote)
     }
 
-    /// Get the expected output amount for a given input.
-    pub async fn get_expected_output(
-        &self,
-        input_mint: &str,
-        output_mint: &str,
-        amount: u64,
-        slippage_bps: u16,
-    ) -> Result<u64> {
-        let quote = self
-            .get_quote(input_mint, output_mint, amount, slippage_bps)
-            .await?;
-
-        let out_amount: u64 = quote
-            .out_amount
-            .parse()
-            .context("Failed to parse Jupiter output amount")?;
-
-        Ok(out_amount)
-    }
 }

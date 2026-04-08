@@ -9,12 +9,6 @@ use crate::models::token::SocialLinks;
 #[derive(Debug, Deserialize)]
 struct MetadataJson {
     #[serde(default)]
-    name: Option<String>,
-    #[serde(default)]
-    symbol: Option<String>,
-    #[serde(default)]
-    description: Option<String>,
-    #[serde(default)]
     external_url: Option<String>,
     #[serde(default)]
     website: Option<String>,

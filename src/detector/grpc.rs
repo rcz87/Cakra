@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::time::Duration;
 
 use anyhow::{Context, Result};
 use futures::{SinkExt, StreamExt};
@@ -11,10 +12,10 @@ use yellowstone_grpc_proto::prelude::{
     SubscribeRequestPing,
 };
 
-use super::parser::RawTransaction;
-use super::pumpfun::PUMPFUN_PROGRAM_ID;
-use super::pumpswap::PUMPSWAP_PROGRAM_ID;
-use super::raydium::{RAYDIUM_AMM_PROGRAM_ID, RAYDIUM_CPMM_PROGRAM_ID};
+const GRPC_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+const GRPC_SUBSCRIBE_TIMEOUT: Duration = Duration::from_secs(10);
+
+use super::parser::{self, GenericInstruction, RawTransaction, TARGET_PROGRAMS};
 
 /// Start the Yellowstone gRPC subscription and forward raw transactions
 /// through the provided channel.
@@ -25,11 +26,14 @@ pub async fn start_grpc_listener(
 ) -> Result<()> {
     info!(endpoint = %endpoint, "Connecting to Yellowstone gRPC...");
 
-    let mut client = GeyserGrpcClient::build_from_shared(endpoint.to_string())?
+    let connect_fut = GeyserGrpcClient::build_from_shared(endpoint.to_string())?
         .x_token(Some(token.to_string()))?
         .tls_config(ClientTlsConfig::new().with_native_roots())?
-        .connect()
+        .connect();
+
+    let mut client = tokio::time::timeout(GRPC_CONNECT_TIMEOUT, connect_fut)
         .await
+        .map_err(|_| anyhow::anyhow!("gRPC connect timed out after {:?}", GRPC_CONNECT_TIMEOUT))?
         .context("Failed to connect to Yellowstone gRPC")?;
 
     info!("Connected to Yellowstone gRPC");
@@ -39,12 +43,7 @@ pub async fn start_grpc_listener(
         HashMap::new();
 
     // Subscribe to transactions involving our target programs
-    let program_ids = vec![
-        PUMPFUN_PROGRAM_ID.to_string(),
-        RAYDIUM_AMM_PROGRAM_ID.to_string(),
-        RAYDIUM_CPMM_PROGRAM_ID.to_string(),
-        PUMPSWAP_PROGRAM_ID.to_string(),
-    ];
+    let program_ids: Vec<String> = TARGET_PROGRAMS.iter().map(|s| s.to_string()).collect();
 
     transaction_filters.insert(
         "token_detectors".to_string(),
@@ -72,10 +71,17 @@ pub async fn start_grpc_listener(
         from_slot: None,
     };
 
-    let (mut subscribe_tx, mut stream) = client
-        .subscribe_with_request(Some(subscribe_request))
-        .await
-        .context("Failed to subscribe to gRPC stream")?;
+    let subscribe_fut = client.subscribe_with_request(Some(subscribe_request));
+    let (mut subscribe_tx, mut stream) =
+        tokio::time::timeout(GRPC_SUBSCRIBE_TIMEOUT, subscribe_fut)
+            .await
+            .map_err(|_| {
+                anyhow::anyhow!(
+                    "gRPC subscribe timed out after {:?} — endpoint may not support Yellowstone",
+                    GRPC_SUBSCRIBE_TIMEOUT
+                )
+            })?
+            .context("Failed to subscribe to gRPC stream")?;
 
     info!("gRPC subscription active - listening for token events");
 
@@ -144,79 +150,38 @@ async fn process_grpc_update(
             .map(|k| bs58::encode(k).into_string())
             .collect();
 
-        // Process each instruction
-        for instruction in &message.instructions {
-            let program_idx = instruction.program_id_index as usize;
-            let program_id = match account_keys.get(program_idx) {
-                Some(id) => id.clone(),
-                None => continue,
-            };
+        // Convert gRPC instructions to generic format
+        let instructions: Vec<GenericInstruction> = message
+            .instructions
+            .iter()
+            .map(|ix| GenericInstruction {
+                program_id_index: ix.program_id_index as usize,
+                accounts: ix.accounts.iter().map(|&a| a as usize).collect(),
+                data: ix.data.clone(),
+            })
+            .collect();
 
-            // Only process instructions for our target programs
-            if program_id != PUMPFUN_PROGRAM_ID
-                && program_id != RAYDIUM_AMM_PROGRAM_ID
-                && program_id != RAYDIUM_CPMM_PROGRAM_ID
-                && program_id != PUMPSWAP_PROGRAM_ID
-            {
-                continue;
-            }
-
-            // Resolve account indices for this instruction
-            let instruction_accounts: Vec<String> = instruction
-                .accounts
-                .iter()
-                .filter_map(|&idx| account_keys.get(idx as usize).cloned())
-                .collect();
-
-            let raw_tx = RawTransaction {
-                _signature: signature.clone(),
-                program_id,
-                data: instruction.data.clone(),
-                accounts: instruction_accounts,
-                _slot: slot,
-            };
-
-            if let Err(e) = tx_sender.send(raw_tx).await {
-                warn!(error = %e, "Failed to send raw transaction to processing channel");
+        // Convert inner instructions (CPI calls)
+        let mut inner_instructions = Vec::new();
+        if let Some(meta) = &tx_info.meta {
+            for inner_group in &meta.inner_instructions {
+                for inner_ix in &inner_group.instructions {
+                    inner_instructions.push(GenericInstruction {
+                        program_id_index: inner_ix.program_id_index as usize,
+                        accounts: inner_ix.accounts.iter().map(|&a| a as usize).collect(),
+                        data: inner_ix.data.clone(),
+                    });
+                }
             }
         }
 
-        // Also process inner instructions (CPI calls)
-        if let Some(meta) = tx_info.meta {
-            for inner_instructions in &meta.inner_instructions {
-                for inner_ix in &inner_instructions.instructions {
-                    let program_idx = inner_ix.program_id_index as usize;
-                    let program_id = match account_keys.get(program_idx) {
-                        Some(id) => id.clone(),
-                        None => continue,
-                    };
+        // Use shared extraction logic
+        let raw_txs =
+            parser::extract_raw_transactions(&signature, slot, &account_keys, &instructions, &inner_instructions);
 
-                    if program_id != PUMPFUN_PROGRAM_ID
-                        && program_id != RAYDIUM_AMM_PROGRAM_ID
-                        && program_id != RAYDIUM_CPMM_PROGRAM_ID
-                        && program_id != PUMPSWAP_PROGRAM_ID
-                    {
-                        continue;
-                    }
-
-                    let instruction_accounts: Vec<String> = inner_ix
-                        .accounts
-                        .iter()
-                        .filter_map(|&idx| account_keys.get(idx as usize).cloned())
-                        .collect();
-
-                    let raw_tx = RawTransaction {
-                        _signature: signature.clone(),
-                        program_id,
-                        data: inner_ix.data.clone(),
-                        accounts: instruction_accounts,
-                        _slot: slot,
-                    };
-
-                    if let Err(e) = tx_sender.send(raw_tx).await {
-                        warn!(error = %e, "Failed to send inner instruction to processing channel");
-                    }
-                }
+        for raw_tx in raw_txs {
+            if let Err(e) = tx_sender.send(raw_tx).await {
+                warn!(error = %e, "Failed to send raw transaction to processing channel");
             }
         }
     }

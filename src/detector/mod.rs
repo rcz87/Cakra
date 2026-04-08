@@ -4,12 +4,13 @@ pub mod pumpfun;
 pub mod pumpswap;
 pub mod queue;
 pub mod raydium;
+pub mod ws;
 
 use anyhow::Result;
 use tokio::sync::mpsc;
 use tracing::{error, info, warn};
 
-use crate::config::Config;
+use crate::config::{Config, DetectorMode};
 use crate::models::token::TokenInfo;
 
 use self::parser::RawTransaction;
@@ -18,9 +19,9 @@ use self::pumpswap::process_pumpswap_transaction;
 use self::queue::DeduplicationQueue;
 use self::raydium::process_raydium_transaction;
 
-/// DetectorService spawns the gRPC listener and processes incoming
-/// raw transactions through all detectors, sending newly detected
-/// tokens through a channel.
+/// DetectorService spawns a streaming listener (gRPC or WebSocket) and
+/// processes incoming raw transactions through all detectors, sending
+/// newly detected tokens through a channel.
 pub struct DetectorService {
     config: Config,
     token_sender: mpsc::Sender<TokenInfo>,
@@ -38,55 +39,107 @@ impl DetectorService {
         (service, token_receiver)
     }
 
-    /// Start the detector service. This spawns the gRPC listener and
-    /// the transaction processing loop.
+    /// Start the detector service. Tries gRPC first (if configured),
+    /// falls back to WebSocket logsSubscribe if gRPC is unavailable.
     pub async fn start(self) -> Result<()> {
         info!("Starting RICOZ SNIPER detector service");
 
         let (raw_tx_sender, raw_tx_receiver) = mpsc::channel::<RawTransaction>(1024);
 
-        // Spawn the gRPC listener
-        let grpc_endpoint = self.config.grpc_endpoint.clone();
-        let grpc_token = self.config.grpc_token.clone();
-        let grpc_handle = tokio::spawn(async move {
-            let mut backoff_secs: u64 = 1;
-            const MAX_BACKOFF_SECS: u64 = 60;
-
-            loop {
-                match grpc::start_grpc_listener(&grpc_endpoint, &grpc_token, raw_tx_sender.clone())
-                    .await
-                {
-                    Ok(()) => {
-                        warn!(
-                            backoff_secs,
-                            "gRPC listener exited cleanly, reconnecting..."
-                        );
-                        // Successful run before exit — reset backoff
-                        backoff_secs = 1;
-                    }
-                    Err(e) => {
-                        error!(
-                            error = %e,
-                            backoff_secs,
-                            "gRPC listener error, reconnecting after backoff"
-                        );
-                    }
-                }
-                tokio::time::sleep(tokio::time::Duration::from_secs(backoff_secs)).await;
-                backoff_secs = (backoff_secs * 2).min(MAX_BACKOFF_SECS);
-            }
-        });
-
-        // Spawn the transaction processing loop
+        // Spawn the transaction processing loop (same regardless of backend)
         let token_sender = self.token_sender;
         let processing_handle = tokio::spawn(async move {
             process_raw_transactions(raw_tx_receiver, token_sender).await;
         });
 
-        // Wait for either task to complete (they shouldn't under normal operation)
+        // Determine which backend to use
+        let use_grpc = match self.config.detector_mode {
+            DetectorMode::Grpc => true,
+            DetectorMode::WebSocket => false,
+            DetectorMode::Auto => {
+                // Try gRPC if endpoint is configured
+                if self.config.grpc_endpoint.is_empty() {
+                    info!("No GRPC_ENDPOINT configured, using WebSocket detector");
+                    false
+                } else {
+                    // Attempt one gRPC connection to test availability
+                    info!("Detector mode: auto — trying gRPC first...");
+                    match grpc::start_grpc_listener(
+                        &self.config.grpc_endpoint,
+                        &self.config.grpc_token,
+                        raw_tx_sender.clone(),
+                    )
+                    .await
+                    {
+                        Ok(()) => {
+                            // gRPC connected then disconnected cleanly — it works, reconnect below
+                            true
+                        }
+                        Err(e) => {
+                            warn!(
+                                error = %e,
+                                "gRPC unavailable, falling back to WebSocket detector"
+                            );
+                            false
+                        }
+                    }
+                }
+            }
+        };
+
+        let backend_name = if use_grpc { "gRPC" } else { "WebSocket" };
+        info!(backend = backend_name, "Detector backend selected");
+
+        // Spawn the listener with reconnection loop
+        let config = self.config.clone();
+        let listener_handle = tokio::spawn(async move {
+            let mut backoff_secs: u64 = 1;
+            const MAX_BACKOFF_SECS: u64 = 60;
+
+            loop {
+                let result = if use_grpc {
+                    grpc::start_grpc_listener(
+                        &config.grpc_endpoint,
+                        &config.grpc_token,
+                        raw_tx_sender.clone(),
+                    )
+                    .await
+                } else {
+                    ws::start_ws_listener(
+                        &config.solana_ws_url,
+                        config.effective_rpc_url(),
+                        raw_tx_sender.clone(),
+                    )
+                    .await
+                };
+
+                match result {
+                    Ok(()) => {
+                        warn!(
+                            backend = backend_name,
+                            backoff_secs, "Listener exited cleanly, reconnecting..."
+                        );
+                        backoff_secs = 1;
+                    }
+                    Err(e) => {
+                        error!(
+                            backend = backend_name,
+                            error = %e,
+                            backoff_secs,
+                            "Listener error, reconnecting after backoff"
+                        );
+                    }
+                }
+
+                tokio::time::sleep(tokio::time::Duration::from_secs(backoff_secs)).await;
+                backoff_secs = (backoff_secs * 2).min(MAX_BACKOFF_SECS);
+            }
+        });
+
+        // Wait for either task to complete
         tokio::select! {
-            result = grpc_handle => {
-                error!("gRPC listener task ended unexpectedly: {:?}", result);
+            result = listener_handle => {
+                error!("Listener task ended unexpectedly: {:?}", result);
             }
             result = processing_handle => {
                 error!("Transaction processing task ended unexpectedly: {:?}", result);
@@ -97,7 +150,7 @@ impl DetectorService {
     }
 }
 
-/// Process raw transactions from the gRPC stream through all detectors.
+/// Process raw transactions from the streaming backend through all detectors.
 async fn process_raw_transactions(
     mut rx: mpsc::Receiver<RawTransaction>,
     token_sender: mpsc::Sender<TokenInfo>,

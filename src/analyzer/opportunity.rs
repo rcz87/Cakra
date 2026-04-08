@@ -191,21 +191,24 @@ impl SolTrendTracker {
             req = req.header("x-api-key", &self.api_key);
         }
         let resp = req.send().await?;
+        let text = resp.text().await?;
 
-        #[derive(Deserialize)]
-        struct PriceResponse {
-            data: std::collections::HashMap<String, PriceData>,
-        }
         #[derive(Deserialize)]
         struct PriceData {
-            price: String,
+            #[serde(alias = "usdPrice")]
+            usd_price: Option<f64>,
+            // Legacy v2 format
+            price: Option<String>,
         }
 
-        let price_resp: PriceResponse = resp.json().await?;
-        let current_price = price_resp
-            .data
+        let price_map: std::collections::HashMap<String, PriceData> =
+            serde_json::from_str(&text).map_err(|e| {
+                tracing::debug!(body = %text, "SOL price response body");
+                anyhow::anyhow!("SOL price parse error: {e}")
+            })?;
+        let current_price = price_map
             .get(SOL_MINT)
-            .and_then(|d| d.price.parse::<f64>().ok())
+            .and_then(|d| d.usd_price.or_else(|| d.price.as_ref()?.parse::<f64>().ok()))
             .unwrap_or(0.0);
 
         self.record_price(current_price);

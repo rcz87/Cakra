@@ -2,6 +2,27 @@ use anyhow::{Context, Result};
 use std::env;
 use std::fmt;
 
+/// Detector backend mode.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DetectorMode {
+    /// Try gRPC first, fall back to WebSocket if unavailable.
+    Auto,
+    /// Only use Yellowstone gRPC (fail if unavailable).
+    Grpc,
+    /// Only use WebSocket logsSubscribe + getTransaction.
+    WebSocket,
+}
+
+impl fmt::Display for DetectorMode {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            DetectorMode::Auto => write!(f, "auto"),
+            DetectorMode::Grpc => write!(f, "grpc"),
+            DetectorMode::WebSocket => write!(f, "websocket"),
+        }
+    }
+}
+
 /// Trading mode determines TP/SL thresholds, timing, and exit behavior.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TradingMode {
@@ -139,6 +160,9 @@ pub struct Config {
     /// "scalp" for fast in/out on new tokens, "hold" for liquid tokens.
     pub trading_mode: TradingMode,
 
+    // Detector
+    pub detector_mode: DetectorMode,
+
     // Network
     pub use_devnet: bool,
 }
@@ -228,6 +252,20 @@ impl Config {
                 "hold" => TradingMode::Hold,
                 other => anyhow::bail!(
                     "Invalid TRADING_MODE '{}': must be 'snipe', 'scalp', or 'hold'",
+                    other
+                ),
+            },
+
+            detector_mode: match env::var("DETECTOR_MODE")
+                .unwrap_or_else(|_| "auto".to_string())
+                .to_lowercase()
+                .as_str()
+            {
+                "auto" => DetectorMode::Auto,
+                "grpc" => DetectorMode::Grpc,
+                "websocket" | "ws" => DetectorMode::WebSocket,
+                other => anyhow::bail!(
+                    "Invalid DETECTOR_MODE '{}': must be 'auto', 'grpc', or 'websocket'",
                     other
                 ),
             },

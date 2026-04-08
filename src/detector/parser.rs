@@ -1,6 +1,22 @@
 use anyhow::{Context, Result};
 
-/// Raw transaction data received from gRPC or other sources.
+use super::pumpfun::PUMPFUN_PROGRAM_ID;
+use super::pumpswap::PUMPSWAP_PROGRAM_ID;
+use super::raydium::{RAYDIUM_AMM_PROGRAM_ID, RAYDIUM_CPMM_PROGRAM_ID};
+
+/// Target program IDs for filtering instructions.
+pub const TARGET_PROGRAMS: &[&str] = &[
+    PUMPFUN_PROGRAM_ID,
+    RAYDIUM_AMM_PROGRAM_ID,
+    RAYDIUM_CPMM_PROGRAM_ID,
+    PUMPSWAP_PROGRAM_ID,
+];
+
+fn is_target_program(program_id: &str) -> bool {
+    TARGET_PROGRAMS.contains(&program_id)
+}
+
+/// Raw transaction data received from gRPC, WebSocket, or other sources.
 #[derive(Debug, Clone)]
 pub struct RawTransaction {
     pub _signature: String,
@@ -8,6 +24,54 @@ pub struct RawTransaction {
     pub data: Vec<u8>,
     pub accounts: Vec<String>,
     pub _slot: u64,
+}
+
+/// Instruction data in a generic format usable by both gRPC and WS backends.
+pub struct GenericInstruction {
+    pub program_id_index: usize,
+    pub accounts: Vec<usize>,
+    pub data: Vec<u8>,
+}
+
+/// Extract RawTransactions from a parsed transaction's instructions.
+/// Used by both gRPC and WebSocket detector backends.
+pub fn extract_raw_transactions(
+    signature: &str,
+    slot: u64,
+    account_keys: &[String],
+    instructions: &[GenericInstruction],
+    inner_instructions: &[GenericInstruction],
+) -> Vec<RawTransaction> {
+    let mut results = Vec::new();
+
+    let all_instructions = instructions.iter().chain(inner_instructions.iter());
+
+    for ix in all_instructions {
+        let program_id = match account_keys.get(ix.program_id_index) {
+            Some(id) => id.clone(),
+            None => continue,
+        };
+
+        if !is_target_program(&program_id) {
+            continue;
+        }
+
+        let instruction_accounts: Vec<String> = ix
+            .accounts
+            .iter()
+            .filter_map(|&idx| account_keys.get(idx).cloned())
+            .collect();
+
+        results.push(RawTransaction {
+            _signature: signature.to_string(),
+            program_id,
+            data: ix.data.clone(),
+            accounts: instruction_accounts,
+            _slot: slot,
+        });
+    }
+
+    results
 }
 
 /// Extract a u64 value (little-endian) from a byte slice at a given offset.

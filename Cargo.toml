@@ -9,6 +9,8 @@ description = "RICOZ SNIPER - Solana Auto-Trading Sniper Bot"
 solana-sdk = "2.2"
 solana-client = "2.2"
 solana-transaction-status = "2.2"
+solana-pubsub-client = "2.2"
+tokio-tungstenite = { version = "0.20", features = ["native-tls"] }
 spl-token = "6.0"
 spl-associated-token-account = "6.0"
 

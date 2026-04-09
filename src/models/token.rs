@@ -20,6 +20,24 @@ impl std::fmt::Display for TokenSource {
     }
 }
 
+/// Which detector backend produced this token event.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum DetectionBackend {
+    /// Helius transactionSubscribe / gRPC — fastest trigger, minimal data
+    Helius,
+    /// PumpPortal subscribeNewToken — slightly slower, rich data (solAmount, marketCap)
+    PumpPortal,
+}
+
+impl std::fmt::Display for DetectionBackend {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            DetectionBackend::Helius => write!(f, "Helius"),
+            DetectionBackend::PumpPortal => write!(f, "PumpPortal"),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TokenInfo {
     pub mint: String,
@@ -33,6 +51,16 @@ pub struct TokenInfo {
     pub metadata_uri: Option<String>,
     pub decimals: u8,
     pub detected_at: DateTime<Utc>,
+    /// Which backend detected this token (for merge engine)
+    #[serde(default = "default_backend")]
+    pub backend: DetectionBackend,
+    /// Market cap in SOL at detection time (from PumpPortal)
+    #[serde(default)]
+    pub market_cap_sol: f64,
+}
+
+fn default_backend() -> DetectionBackend {
+    DetectionBackend::Helius
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]

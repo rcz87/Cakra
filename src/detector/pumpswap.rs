@@ -2,7 +2,7 @@ use anyhow::Result;
 use chrono::Utc;
 use tracing::{info, warn};
 
-use crate::models::token::{TokenInfo, TokenSource};
+use crate::models::token::{DetectionBackend, TokenInfo, TokenSource};
 use super::parser::{self, RawTransaction};
 
 /// PumpSwap program ID (migration from Pump.fun bonding curve to AMM).
@@ -89,8 +89,8 @@ fn parse_create_pool_fields(data: &[u8], accounts: &[String]) -> Result<TokenInf
 
     Ok(TokenInfo {
         mint: token_mint,
-        name: String::new(),   // Must be fetched from on-chain metadata
-        symbol: String::new(), // Must be fetched from on-chain metadata
+        name: String::new(),
+        symbol: String::new(),
         source: TokenSource::PumpSwap,
         creator,
         initial_liquidity_sol,
@@ -99,6 +99,8 @@ fn parse_create_pool_fields(data: &[u8], accounts: &[String]) -> Result<TokenInf
         metadata_uri: None,
         decimals: 6,
         detected_at: Utc::now(),
+        backend: DetectionBackend::Helius,
+        market_cap_sol: 0.0,
     })
 }
 

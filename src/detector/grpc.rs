@@ -24,7 +24,7 @@ pub async fn start_grpc_listener(
     token: &str,
     tx_sender: mpsc::Sender<RawTransaction>,
 ) -> Result<()> {
-    info!(endpoint = %endpoint, "Connecting to Yellowstone gRPC...");
+    info!(endpoint = %endpoint, "Connecting to gRPC (Yellowstone/LaserStream)...");
 
     let connect_fut = GeyserGrpcClient::build_from_shared(endpoint.to_string())?
         .x_token(Some(token.to_string()))?
@@ -72,16 +72,22 @@ pub async fn start_grpc_listener(
     };
 
     let subscribe_fut = client.subscribe_with_request(Some(subscribe_request));
-    let (mut subscribe_tx, mut stream) =
-        tokio::time::timeout(GRPC_SUBSCRIBE_TIMEOUT, subscribe_fut)
-            .await
-            .map_err(|_| {
-                anyhow::anyhow!(
-                    "gRPC subscribe timed out after {:?} — endpoint may not support Yellowstone",
-                    GRPC_SUBSCRIBE_TIMEOUT
-                )
-            })?
-            .context("Failed to subscribe to gRPC stream")?;
+    let subscribe_result = tokio::time::timeout(GRPC_SUBSCRIBE_TIMEOUT, subscribe_fut)
+        .await
+        .map_err(|_| {
+            anyhow::anyhow!(
+                "gRPC subscribe timed out after {:?} — endpoint may not support Yellowstone",
+                GRPC_SUBSCRIBE_TIMEOUT
+            )
+        })?;
+
+    let (mut subscribe_tx, mut stream) = match subscribe_result {
+        Ok(pair) => pair,
+        Err(e) => {
+            error!(error = %e, "gRPC subscribe failed — check endpoint/plan compatibility");
+            return Err(e).context("Failed to subscribe to gRPC stream");
+        }
+    };
 
     info!("gRPC subscription active - listening for token events");
 

@@ -31,6 +31,8 @@ pub struct QuoteResponse {
 pub struct RoutePlan {
     pub swap_info: SwapInfo,
     pub percent: u8,
+    #[serde(default)]
+    pub bps: Option<u16>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -42,8 +44,12 @@ pub struct SwapInfo {
     pub output_mint: String,
     pub in_amount: String,
     pub out_amount: String,
-    pub fee_amount: String,
-    pub fee_mint: String,
+    #[serde(default)]
+    pub fee_amount: Option<String>,
+    #[serde(default)]
+    pub fee_mint: Option<String>,
+    #[serde(flatten)]
+    pub extra: serde_json::Value,
 }
 
 // ── Swap Instructions API types ────────────────────────────────────

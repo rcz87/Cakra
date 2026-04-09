@@ -1,9 +1,11 @@
+pub mod helius_sender;
 pub mod jito;
 pub mod jupiter;
 pub mod positions;
 pub mod price_feed;
 pub mod priority;
 pub mod pumpfun_buy;
+pub mod pumpportal_trade;
 pub mod raydium;
 pub mod retry;
 pub mod router;
@@ -28,9 +30,11 @@ use crate::models::token::TokenInfo;
 use crate::models::trade::{Trade, TradeType, TradeStatus};
 use crate::risk::{RiskManager, CooldownManager, ListManager, RiskCheck};
 
+use self::helius_sender::HeliusSender;
 use self::jito::JitoClient;
 use self::jupiter::{JupiterClient, to_solana_instruction};
 use self::positions::PositionManager;
+use self::pumpportal_trade::PumpPortalTradeClient;
 use self::retry::retry_with_backoff;
 use self::router::{find_best_route, RouteType};
 
@@ -39,8 +43,10 @@ use self::router::{find_best_route, RouteType};
 pub struct ExecutorService {
     pub config: Arc<Config>,
     pub rpc: Arc<RpcClient>,
+    pub sender: HeliusSender,
     pub jito: JitoClient,
     pub jupiter: JupiterClient,
+    pub pumpportal: PumpPortalTradeClient,
     pub positions: PositionManager,
     pub db: DbPool,
     pub risk: RiskManager,
@@ -57,15 +63,20 @@ impl ExecutorService {
         lists: ListManager,
         positions: PositionManager,
     ) -> Self {
-        let rpc = Arc::new(RpcClient::new(config.effective_rpc_url().to_string()));
+        let rpc_url = config.effective_rpc_url().to_string();
+        let rpc = Arc::new(RpcClient::new(rpc_url.clone()));
+        let sender = HeliusSender::new(&rpc_url);
         let jito = JitoClient::new(&config.jito_block_engine_url);
         let jupiter = JupiterClient::new(&config.jupiter_api_url, &config.jupiter_api_key);
+        let pumpportal = PumpPortalTradeClient::new();
 
         Self {
             config,
             rpc,
+            sender,
             jito,
             jupiter,
+            pumpportal,
             positions,
             db,
             risk,
@@ -152,10 +163,99 @@ impl ExecutorService {
 
         let expected_output = route.expected_output;
 
-        // 2. Build instructions based on route type
+        // 2. Build and execute based on route type
+        //
+        // PumpPortalDirect: PumpPortal builds the entire tx, we sign and Jito-submit.
+        // PumpFun/Jupiter: we build instructions, sign tx, and Jito-submit ourselves.
+
+        if route.route_type == RouteType::PumpPortalDirect {
+            // === PumpPortal Direct path: fastest for PumpFun tokens ===
+            let jito_tip_sol = self.config.jito_tip_lamports as f64 / 1_000_000_000.0;
+
+            // Determine pool type
+            let pool = match token.source {
+                crate::models::token::TokenSource::PumpFun => "pump",
+                crate::models::token::TokenSource::PumpSwap => "pump-amm",
+                _ => "auto",
+            };
+
+            let signature = self
+                .pumpportal
+                .execute_buy(
+                    &token.mint,
+                    amount_sol,
+                    slippage_bps,
+                    jito_tip_sol,
+                    wallet,
+                    pool,
+                )
+                .await
+                .context("PumpPortal buy execution failed")?;
+
+            info!(
+                mint = %token.mint,
+                signature = %signature,
+                route = "PumpPortalDirect",
+                "Buy executed via PumpPortal + Jito"
+            );
+
+            // Record position (same as existing flow)
+            let actual_output = self.verify_buy_balance(
+                wallet, &token.mint, expected_output
+            ).await.unwrap_or(expected_output);
+
+            let entry_price = if actual_output > 0 {
+                amount_sol / (actual_output as f64 / 1_000_000.0)
+            } else {
+                0.0
+            };
+
+            self.positions.open_position(
+                &token.mint,
+                &token.symbol,
+                &taker,
+                entry_price,
+                amount_sol,
+                actual_output as f64,
+                slippage_bps,
+                &signature,
+                0,
+            )?;
+
+            self.cooldown.record_trade(&taker);
+
+            let trade = Trade {
+                id: Uuid::new_v4().to_string(),
+                token_mint: token.mint.clone(),
+                token_symbol: token.symbol.clone(),
+                trade_type: TradeType::Buy,
+                amount_sol,
+                amount_tokens: actual_output as f64,
+                price_per_token: entry_price,
+                slippage_bps,
+                tx_signature: Some(signature.clone()),
+                status: TradeStatus::Confirmed,
+                wallet_pubkey: taker.clone(),
+                created_at: Utc::now(),
+                confirmed_at: Some(Utc::now()),
+                pnl_sol: None,
+                security_score: None,
+            };
+
+            if let Err(e) = db::queries::insert_trade(&self.db, &trade) {
+                warn!(error = %e, "Failed to record PumpPortal trade in DB");
+            }
+
+            return Ok(signature);
+        }
+
+        // === Legacy instruction-building path (PumpFun direct / Jupiter) ===
         let mut instructions = Vec::new();
 
         match route.route_type {
+            RouteType::PumpPortalDirect => {
+                unreachable!("PumpPortalDirect handled above with early return");
+            }
             RouteType::PumpFun => {
                 // Direct PumpFun bonding curve buy — fastest path for new tokens
                 let mint_pubkey: Pubkey = token.mint.parse()
@@ -244,8 +344,15 @@ impl ExecutorService {
             }
         }
 
-        // Fetch a fresh blockhash right before signing to avoid stale blockhash
-        // if the quote + swap-instructions steps took too long.
+        // Add Helius Sender tip to instructions (for dual routing)
+        instructions.push(
+            HeliusSender::build_tip_instruction(
+                &wallet.pubkey(),
+                self.config.jito_tip_lamports,
+            )?
+        );
+
+        // Fetch a fresh blockhash right before signing
         let recent_blockhash = self
             .rpc
             .get_latest_blockhash()
@@ -259,57 +366,36 @@ impl ExecutorService {
             recent_blockhash,
         );
 
-        // 4. Submit via Jito bundle for MEV protection
         let blockhash_age = blockhash_fetched.elapsed();
         if blockhash_age.as_secs() >= 60 {
             anyhow::bail!(
-                "Blockhash became stale before bundle submission (age: {}s). Aborting buy.",
+                "Blockhash became stale (age: {}s). Aborting buy.",
                 blockhash_age.as_secs()
             );
         }
 
-        let bundle_id = self
-            .jito
-            .submit_bundle(
-                vec![swap_tx],
-                self.config.jito_tip_lamports,
-                wallet,
-                recent_blockhash,
-            )
-            .await
-            .context("Failed to submit buy bundle to Jito")?;
+        // 4. Submit: Helius Sender (default) or Jito Bundle (premium)
+        //
+        // Routing logic:
+        //   single tx + normal score → Helius Sender (fast, free, dual routing)
+        //   multi-tx or high conviction → Jito Bundle (atomic, MEV-aware)
+        //
+        // For now, all single-tx buys use Sender. Jito stays available for
+        // future multi-wallet/multi-step flows.
+        let signature = {
+            let serialized = bincode::serialize(&swap_tx)
+                .context("Failed to serialize swap tx")?;
 
-        // 5. Confirm the bundle landed
-        let confirmation = self
-            .jito
-            .confirm_bundle(&bundle_id, 60)
-            .await
-            .context("Failed to confirm buy bundle")?;
-
-        if !confirmation.is_landed() {
-            anyhow::bail!(
-                "Buy bundle did not land for mint {} (bundle_id: {})",
-                token.mint,
-                bundle_id
+            info!(
+                mint = %token.mint,
+                executor = "HeliusSender",
+                "Submitting buy via Helius Sender (dual routing)"
             );
-        }
 
-        // Extract real transaction signature — refuse bundle ID as fallback
-        let signature = match confirmation.swap_signature() {
-            Some(sig) => sig.to_string(),
-            None => {
-                error!(
-                    mint = %token.mint,
-                    bundle_id = %bundle_id,
-                    "Buy bundle landed but transaction signature unavailable. \
-                     Bundle ID is NOT a valid tx signature — aborting position tracking."
-                );
-                anyhow::bail!(
-                    "Buy bundle landed but no transaction signature returned (bundle_id: {}). \
-                     Funds may have been spent — check wallet manually.",
-                    bundle_id
-                );
-            }
+            self.sender
+                .send_and_confirm(&serialized, 60)
+                .await
+                .context("Helius Sender buy failed")?
         };
 
         // 6. Verify actual on-chain token balance with retry
@@ -459,6 +545,49 @@ impl ExecutorService {
         Ok(signature)
     }
 
+    /// Verify on-chain token balance after a buy, with retries.
+    async fn verify_buy_balance(
+        &self,
+        wallet: &Keypair,
+        mint_str: &str,
+        expected_output: u64,
+    ) -> Result<u64> {
+        let mint_pubkey: Pubkey = mint_str.parse().context("Invalid mint")?;
+        let token_program: Pubkey = "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA"
+            .parse()
+            .unwrap();
+        let ata_program: Pubkey = "ATokenGPvbdGVxr1b2hvZbsiqW5xWH25efTNsLJA8knL"
+            .parse()
+            .unwrap();
+        let (ata, _) = Pubkey::find_program_address(
+            &[
+                wallet.pubkey().as_ref(),
+                token_program.as_ref(),
+                mint_pubkey.as_ref(),
+            ],
+            &ata_program,
+        );
+
+        for attempt in 0..3u32 {
+            if attempt > 0 {
+                tokio::time::sleep(std::time::Duration::from_secs(1 << attempt)).await;
+            }
+            match self.rpc.get_token_account_balance(&ata) {
+                Ok(balance) => {
+                    let bal: u64 = balance.amount.parse().unwrap_or(0);
+                    if bal > 0 {
+                        return Ok(bal);
+                    }
+                }
+                Err(e) => {
+                    warn!(mint = %mint_str, attempt = attempt + 1, error = %e, "Balance check retry");
+                }
+            }
+        }
+
+        Ok(expected_output) // Fallback to expected if verification fails
+    }
+
     /// Execute a sell for a given token mint. Sells `amount_pct`% of holdings.
     /// Returns the transaction signature on success.
     pub async fn execute_sell(
@@ -564,8 +693,14 @@ impl ExecutorService {
             }
         }
 
-        // Fetch a fresh blockhash right before signing to avoid stale blockhash
-        // if the quote + swap-instructions steps took too long.
+        // Add Helius Sender tip
+        instructions.push(
+            HeliusSender::build_tip_instruction(
+                &wallet.pubkey(),
+                self.config.jito_tip_lamports,
+            )?
+        );
+
         let recent_blockhash = self
             .rpc
             .get_latest_blockhash()
@@ -579,57 +714,29 @@ impl ExecutorService {
             recent_blockhash,
         );
 
-        // 4. Submit via Jito bundle
         let blockhash_age = blockhash_fetched.elapsed();
         if blockhash_age.as_secs() >= 60 {
             anyhow::bail!(
-                "Blockhash became stale before sell bundle submission (age: {}s). Aborting sell.",
+                "Blockhash became stale (age: {}s). Aborting sell.",
                 blockhash_age.as_secs()
             );
         }
 
-        let bundle_id = self
-            .jito
-            .submit_bundle(
-                vec![swap_tx],
-                self.config.jito_tip_lamports,
-                wallet,
-                recent_blockhash,
-            )
-            .await
-            .context("Failed to submit sell bundle to Jito")?;
+        // 4. Submit sell via Helius Sender (default single-tx path)
+        let signature = {
+            let serialized = bincode::serialize(&swap_tx)
+                .context("Failed to serialize sell tx")?;
 
-        // 5. Confirm the bundle landed
-        let confirmation = self
-            .jito
-            .confirm_bundle(&bundle_id, 60)
-            .await
-            .context("Failed to confirm sell bundle")?;
-
-        if !confirmation.is_landed() {
-            anyhow::bail!(
-                "Sell bundle did not land for mint {} (bundle_id: {})",
-                mint,
-                bundle_id
+            info!(
+                mint = %mint,
+                executor = "HeliusSender",
+                "Submitting sell via Helius Sender"
             );
-        }
 
-        // Extract real transaction signature — refuse bundle ID as fallback
-        let signature = match confirmation.swap_signature() {
-            Some(sig) => sig.to_string(),
-            None => {
-                error!(
-                    mint = %mint,
-                    bundle_id = %bundle_id,
-                    "Sell bundle landed but transaction signature unavailable. \
-                     Cannot verify sell outcome."
-                );
-                anyhow::bail!(
-                    "Sell bundle landed but no transaction signature returned (bundle_id: {}). \
-                     Check wallet balance manually.",
-                    bundle_id
-                );
-            }
+            self.sender
+                .send_and_confirm(&serialized, 60)
+                .await
+                .context("Helius Sender sell failed")?
         };
 
         // 6. Verify sell outcome via balance check + signature polling fallback

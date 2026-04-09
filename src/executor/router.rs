@@ -3,7 +3,7 @@ use chrono::Utc;
 use solana_client::rpc_client::RpcClient;
 use tracing::{debug, info, warn};
 
-use crate::config::{Config, TradingMode};
+use crate::config::Config;
 use crate::models::token::{TokenInfo, TokenSource};
 
 use super::jupiter::JupiterClient;
@@ -11,7 +11,13 @@ use super::jupiter::JupiterClient;
 /// The type of route selected for the swap.
 #[derive(Debug, Clone, PartialEq)]
 pub enum RouteType {
+    /// PumpPortal Local Trade API + Jito bundle (for PumpFun tokens)
+    /// Fastest path: PumpPortal builds tx, we sign, Jito submits.
+    /// 0.5% fee but includes MEV protection + optimized routing.
+    PumpPortalDirect,
+    /// Legacy direct PumpFun bonding curve buy (manual instruction building)
     PumpFun,
+    /// Jupiter aggregator (covers all DEXes)
     Jupiter,
 }
 
@@ -74,43 +80,37 @@ pub async fn find_best_route(
         "Finding best route"
     );
 
-    // For snipe mode + PumpFun + very new token: try PumpFun direct FIRST
-    // (fastest path — don't waste time on Jupiter for tokens it hasn't indexed yet)
-    let pumpfun_first = config.trading_mode == TradingMode::Snipe
-        && matches!(token.source, TokenSource::PumpFun)
-        && token_age_secs < PUMPFUN_FALLBACK_AGE_SECS;
-
-    if pumpfun_first {
+    // For PumpFun tokens: always prefer PumpPortal Direct (fastest + MEV protected)
+    // PumpPortal handles tx building + Jito tip, we just sign and submit.
+    if matches!(token.source, TokenSource::PumpFun) {
         info!(
             mint = %token.mint,
             age_secs = token_age_secs,
-            "Snipe mode: trying PumpFun direct FIRST (skip Jupiter)"
+            "PumpFun token → PumpPortal Direct route (Jito bundle)"
         );
 
-        match get_pumpfun_quote(token, amount_sol).await {
-            Ok(candidate) if candidate.expected_output > 0 && candidate.price_impact <= 20.0 => {
-                let min_output = calculate_min_output(candidate.expected_output, slippage_bps);
-                let route = Route {
-                    route_type: RouteType::PumpFun,
-                    expected_output: candidate.expected_output,
-                    min_output,
-                    price_impact_pct: candidate.price_impact,
-                };
-                info!(
-                    route = ?route.route_type,
-                    expected_output = route.expected_output,
-                    price_impact = route.price_impact_pct,
-                    "PumpFun-first route selected (snipe mode)"
-                );
-                return Ok(route);
-            }
-            Ok(_) => {
-                warn!("PumpFun-first: quote rejected (zero output or high impact), trying Jupiter");
-            }
-            Err(e) => {
-                warn!("PumpFun-first: quote failed: {e}, trying Jupiter");
-            }
-        }
+        // PumpPortal doesn't provide a quote — it builds the full tx.
+        // Use bonding curve estimate for expected output tracking.
+        let estimated = get_pumpfun_quote(token, amount_sol).await;
+        let (expected_output, price_impact) = match estimated {
+            Ok(c) => (c.expected_output, c.price_impact),
+            Err(_) => (0, 0.0), // PumpPortal will handle pricing
+        };
+
+        let route = Route {
+            route_type: RouteType::PumpPortalDirect,
+            expected_output,
+            min_output: calculate_min_output(expected_output, slippage_bps),
+            price_impact_pct: price_impact,
+        };
+
+        info!(
+            route = ?route.route_type,
+            estimated_output = expected_output,
+            "PumpPortal Direct route selected"
+        );
+
+        return Ok(route);
     }
 
     // Standard path: try Jupiter aggregator first
@@ -154,8 +154,8 @@ pub async fn find_best_route(
         }
     }
 
-    // 2. If Jupiter had no route and token is from PumpFun and very new, try direct bonding curve
-    if matches!(token.source, TokenSource::PumpFun) && token_age_secs < PUMPFUN_FALLBACK_AGE_SECS {
+    // 2. If Jupiter had no route and token is from PumpSwap (migrated PumpFun), try PumpPortal
+    if matches!(token.source, TokenSource::PumpFun | TokenSource::PumpSwap) && token_age_secs < PUMPFUN_FALLBACK_AGE_SECS {
         info!(
             mint = %token.mint,
             age_secs = token_age_secs,

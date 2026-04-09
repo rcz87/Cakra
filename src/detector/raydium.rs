@@ -2,7 +2,7 @@ use anyhow::Result;
 use chrono::Utc;
 use tracing::{info, warn};
 
-use crate::models::token::{TokenInfo, TokenSource};
+use crate::models::token::{DetectionBackend, TokenInfo, TokenSource};
 use super::parser::{self, RawTransaction};
 
 /// Raydium AMM V4 program ID on Solana mainnet.
@@ -115,16 +115,18 @@ fn parse_initialize2_fields(data: &[u8], accounts: &[String]) -> Result<TokenInf
 
     Ok(TokenInfo {
         mint: token_mint,
-        name: String::new(),   // Must be fetched from metadata
-        symbol: String::new(), // Must be fetched from metadata
+        name: String::new(),
+        symbol: String::new(),
         source: TokenSource::Raydium,
         creator: user_wallet,
         initial_liquidity_sol,
-        initial_liquidity_usd: 0.0, // Will be calculated later
+        initial_liquidity_usd: 0.0,
         pool_address: Some(pool_address),
         metadata_uri: None,
-        decimals: 0, // Must be fetched on-chain
+        decimals: 0,
         detected_at: Utc::now(),
+        backend: DetectionBackend::Helius,
+        market_cap_sol: 0.0,
     })
 }
 
@@ -221,6 +223,8 @@ fn parse_cpmm_initialize_fields(data: &[u8], accounts: &[String]) -> Result<Toke
         metadata_uri: None,
         decimals: 0,
         detected_at: Utc::now(),
+        backend: DetectionBackend::Helius,
+        market_cap_sol: 0.0,
     })
 }
 

@@ -37,6 +37,15 @@ impl DeduplicationQueue {
         true
     }
 
+    /// Check if a mint is already in the queue (not expired).
+    pub fn contains(&self, mint: &str) -> bool {
+        if let Some(inserted_at) = self.entries.get(mint) {
+            std::time::Instant::now().duration_since(*inserted_at) < self.ttl
+        } else {
+            false
+        }
+    }
+
     /// Remove expired entries from the queue.
     pub fn cleanup(&mut self) {
         let now = Instant::now();

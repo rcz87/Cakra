@@ -11,7 +11,7 @@ use super::{BotState, PendingAction};
 use super::{buy_ui, history_ui, menu, positions_ui, settings_ui, sniper_ui, wallet_ui};
 use crate::db::queries as db;
 use crate::models::UserSettings;
-use crate::models::token::{TokenInfo, TokenSource};
+use crate::models::token::{DetectionBackend, TokenInfo, TokenSource};
 
 /// All available slash-commands for the bot.
 #[derive(BotCommands, Clone, Debug)]
@@ -240,6 +240,8 @@ Atur TP/SL, slippage, max buy,\ndan parameter lainnya.\n\n\
                             metadata_uri: None,
                             decimals: 9,
                             detected_at: Utc::now(),
+                            backend: DetectionBackend::Helius,
+                            market_cap_sol: 0.0,
                         };
 
                         let slippage = state.config.default_slippage_bps;

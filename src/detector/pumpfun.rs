@@ -2,15 +2,15 @@ use anyhow::Result;
 use chrono::Utc;
 use tracing::{info, warn};
 
-use crate::models::token::{TokenInfo, TokenSource};
+use crate::models::token::{DetectionBackend, TokenInfo, TokenSource};
 use super::parser::{self, RawTransaction};
 
 /// Pump.fun program ID on Solana mainnet.
 pub const PUMPFUN_PROGRAM_ID: &str = "6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P";
 
-/// Anchor discriminator for the Pump.fun "create" instruction.
-/// This is the first 8 bytes of SHA256("global:create").
-const CREATE_DISCRIMINATOR: [u8; 8] = [0x18, 0x1e, 0xc8, 0x28, 0x05, 0x1c, 0x07, 0x77];
+/// Discriminator for the current Pump.fun "create" instruction.
+/// PumpFun updated their program — this is the live discriminator as of 2026-04.
+const CREATE_DISCRIMINATOR: [u8; 8] = [0xd6, 0x90, 0x4c, 0xec, 0x5f, 0x8b, 0x31, 0xb4];
 
 /// Parse a Pump.fun "create" instruction to extract token information.
 ///
@@ -19,15 +19,18 @@ const CREATE_DISCRIMINATOR: [u8; 8] = [0x18, 0x1e, 0xc8, 0x28, 0x05, 0x1c, 0x07,
 ///   - symbol: length-prefixed string
 ///   - uri: length-prefixed string
 ///
-/// Account layout for create:
-///   [0] mint
-///   [1] mint_authority
-///   [2] bonding_curve
-///   [3] associated_bonding_curve
-///   [4] global
-///   [5] mpl_token_metadata
-///   [6] metadata
-///   [7] user (creator)
+/// Account layout for create (current, 16 accounts):
+///   [0]  mint
+///   [1]  mint_authority
+///   [2]  bonding_curve
+///   [3]  associated_bonding_curve
+///   [4]  global_config
+///   [5]  user (creator / signer)
+///   [6]  system_program
+///   [7]  token_program
+///   [8]  associated_token_program
+///   [9]  event_authority
+///   [10..15] other accounts
 ///   ...
 pub fn parse_pumpfun_create(data: &[u8]) -> Option<TokenInfo> {
     if data.len() < 8 {
@@ -72,19 +75,32 @@ fn parse_create_fields(data: &[u8]) -> Result<TokenInfo> {
     );
 
     Ok(TokenInfo {
-        mint: String::new(), // Will be populated from accounts
+        mint: String::new(),
         name,
         symbol,
         source: TokenSource::PumpFun,
-        creator: String::new(), // Will be populated from accounts
+        creator: String::new(),
         initial_liquidity_sol: 0.0,
         initial_liquidity_usd: 0.0,
         pool_address: None,
         metadata_uri: Some(uri),
-        decimals: 6, // Pump.fun tokens use 6 decimals
+        decimals: 6,
         detected_at: Utc::now(),
+        backend: DetectionBackend::Helius,
+        market_cap_sol: 0.0,
     })
 }
+
+/// Known program addresses that should NOT be treated as creator.
+const KNOWN_PROGRAMS: &[&str] = &[
+    "11111111111111111111111111111111",
+    "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA",
+    "TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb",
+    "ATokenGPvbdGVxr1b2hvZbsiqW5xWH25efTNsLJA8knL",
+    "TSLvdd1pWpHVjahSpsvCXUbgwsL3JAcvokwaKt1eokM",
+    "MAyhSmzXzV1pTf7LsNkrNwkWKTo4ougAJ1PPg47MD4e",
+    PUMPFUN_PROGRAM_ID,
+];
 
 /// Process a raw transaction and attempt to parse it as a Pump.fun create event.
 /// Populates mint and creator from the transaction's account list.
@@ -96,10 +112,21 @@ pub fn process_pumpfun_transaction(tx: &RawTransaction) -> Option<TokenInfo> {
         token_info.mint = mint.clone();
     }
 
-    // Account[7] = creator (user)
-    if let Some(creator) = tx.accounts.get(7) {
-        token_info.creator = creator.clone();
-    }
+    // Creator is at account[5] in the new layout, but may vary.
+    // Try [5] first, then scan for first non-program address after index 3.
+    let creator = tx
+        .accounts
+        .get(5)
+        .filter(|a| !KNOWN_PROGRAMS.contains(&a.as_str()))
+        .or_else(|| {
+            tx.accounts
+                .iter()
+                .skip(3)
+                .find(|a| !KNOWN_PROGRAMS.contains(&a.as_str()))
+        })
+        .cloned()
+        .unwrap_or_default();
+    token_info.creator = creator;
 
     info!(
         mint = %token_info.mint,

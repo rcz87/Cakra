@@ -34,6 +34,7 @@ pub fn calculate_score(
     analysis: &SecurityAnalysis,
     initial_liquidity_usd: f64,
     initial_liquidity_sol: f64,
+    market_cap_sol: f64,
 ) -> u8 {
     // Fallback: if USD is unknown, estimate from SOL (conservative $100/SOL)
     let effective_liquidity_usd = if initial_liquidity_usd > 0.0 {
@@ -83,13 +84,23 @@ pub fn calculate_score(
         0.0
     };
 
-    let liquidity_score = if effective_liquidity_usd >= 10_000.0 {
+    let liq_usd_score = if effective_liquidity_usd >= 10_000.0 {
         100.0
     } else if effective_liquidity_usd >= 1_000.0 {
         50.0
     } else {
         0.0
     };
+    let mcap_score = if market_cap_sol >= 50.0 {
+        100.0
+    } else if market_cap_sol >= 20.0 {
+        70.0
+    } else if market_cap_sol >= 5.0 {
+        40.0
+    } else {
+        0.0
+    };
+    let liquidity_score = f64::max(liq_usd_score, mcap_score);
 
     let weighted_total = (mint_score * WEIGHT_MINT_RENOUNCED
         + freeze_score * WEIGHT_FREEZE_AUTH
@@ -132,6 +143,7 @@ pub fn calculate_score_fast(
     analysis: &SecurityAnalysis,
     initial_liquidity_usd: f64,
     initial_liquidity_sol: f64,
+    market_cap_sol: f64,
 ) -> u8 {
     let effective_liquidity_usd = if initial_liquidity_usd > 0.0 {
         initial_liquidity_usd
@@ -156,15 +168,25 @@ pub fn calculate_score_fast(
         LpStatus::NotBurned => 20.0, // not zero — PumpFun tokens often don't lock LP
         LpStatus::Unknown => 40.0,   // neutral, not punitive
     };
-    let liquidity_score = if effective_liquidity_usd >= 10_000.0 {
+    let liq_usd_score = if effective_liquidity_usd >= 10_000.0 {
         100.0
     } else if effective_liquidity_usd >= 1_000.0 {
         50.0
     } else if effective_liquidity_usd >= 200.0 {
-        25.0 // low but not zero for new tokens
+        25.0
     } else {
         0.0
     };
+    let mcap_score = if market_cap_sol >= 50.0 {
+        100.0
+    } else if market_cap_sol >= 20.0 {
+        70.0
+    } else if market_cap_sol >= 5.0 {
+        40.0
+    } else {
+        0.0
+    };
+    let liquidity_score = f64::max(liq_usd_score, mcap_score);
 
     // Weights for checked fields only (sum = 100)
     const W_MINT: f64 = 25.0;
@@ -222,14 +244,14 @@ mod tests {
             final_score: 0,
         };
 
-        let score = calculate_score(&analysis, 50_000.0, 0.0);
+        let score = calculate_score(&analysis, 50_000.0, 0.0, 0.0);
         assert_eq!(score, 100);
     }
 
     #[test]
     fn test_zero_score() {
         let analysis = SecurityAnalysis::default();
-        let score = calculate_score(&analysis, 0.0, 0.0);
+        let score = calculate_score(&analysis, 0.0, 0.0, 0.0);
         assert_eq!(score, 0);
     }
 
@@ -258,7 +280,7 @@ mod tests {
             final_score: 0,
         };
 
-        let score = calculate_score(&analysis, 5_000.0, 0.0);
+        let score = calculate_score(&analysis, 5_000.0, 0.0, 0.0);
         assert!(score > 40 && score < 80, "Score was {}", score);
     }
 }

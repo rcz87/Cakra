@@ -91,6 +91,7 @@ impl AnalyzerService {
             &analysis,
             token.initial_liquidity_usd,
             token.initial_liquidity_sol,
+            token.market_cap_sol,
         );
 
         info!(
@@ -229,6 +230,7 @@ impl AnalyzerService {
             &analysis,
             token.initial_liquidity_usd,
             token.initial_liquidity_sol,
+            token.market_cap_sol,
         );
         info!(
             mint = %token.mint,

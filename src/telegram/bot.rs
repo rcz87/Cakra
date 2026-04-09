@@ -35,6 +35,10 @@ pub enum Command {
     Settings,
     #[command(description = "Trade history")]
     History,
+    #[command(description = "Emergency stop — pause auto-buy")]
+    Stop,
+    #[command(description = "Resume auto-buy after /stop")]
+    Go,
 }
 
 /// Entry-point for all recognised commands.
@@ -54,6 +58,8 @@ pub async fn handle_command(
         Command::Wallet => handle_wallet(bot, msg, state).await?,
         Command::Settings => handle_settings(bot, msg, state).await?,
         Command::History => handle_history(bot, msg, state).await?,
+        Command::Stop => handle_stop(bot, msg, state).await?,
+        Command::Go => handle_go(bot, msg, state).await?,
     }
     Ok(())
 }
@@ -881,4 +887,43 @@ fn load_wallet_infos(state: &BotState) -> Vec<wallet_ui::WalletInfo> {
             vec![]
         }
     }
+}
+
+async fn handle_stop(
+    bot: Bot,
+    msg: Message,
+    state: Arc<BotState>,
+) -> Result<(), teloxide::RequestError> {
+    use std::sync::atomic::Ordering;
+    state.trading_active.store(false, Ordering::Relaxed);
+    info!("Kill switch ACTIVATED via /stop");
+    bot.send_message(
+        msg.chat.id,
+        "\u{1f6d1} <b>Auto-buy PAUSED</b>\n\n\
+         Bot masih mendeteksi dan menganalisis token,\n\
+         tapi TIDAK akan auto-buy.\n\n\
+         Gunakan /go untuk resume.",
+    )
+    .parse_mode(ParseMode::Html)
+    .await?;
+    Ok(())
+}
+
+async fn handle_go(
+    bot: Bot,
+    msg: Message,
+    state: Arc<BotState>,
+) -> Result<(), teloxide::RequestError> {
+    use std::sync::atomic::Ordering;
+    state.trading_active.store(true, Ordering::Relaxed);
+    info!("Kill switch DEACTIVATED via /go");
+    bot.send_message(
+        msg.chat.id,
+        "\u{2705} <b>Auto-buy RESUMED</b>\n\n\
+         Bot sekarang akan auto-buy token yang memenuhi score threshold.\n\n\
+         Gunakan /stop untuk pause kapan saja.",
+    )
+    .parse_mode(ParseMode::Html)
+    .await?;
+    Ok(())
 }

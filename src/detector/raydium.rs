@@ -127,6 +127,8 @@ fn parse_initialize2_fields(data: &[u8], accounts: &[String]) -> Result<TokenInf
         detected_at: Utc::now(),
         backend: DetectionBackend::Helius,
         market_cap_sol: 0.0,
+        v_sol_in_bonding_curve: 0.0,
+        initial_buy_sol: 0.0,
     })
 }
 
@@ -225,6 +227,8 @@ fn parse_cpmm_initialize_fields(data: &[u8], accounts: &[String]) -> Result<Toke
         detected_at: Utc::now(),
         backend: DetectionBackend::Helius,
         market_cap_sol: 0.0,
+        v_sol_in_bonding_curve: 0.0,
+        initial_buy_sol: 0.0,
     })
 }
 

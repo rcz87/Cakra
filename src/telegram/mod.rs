@@ -15,6 +15,7 @@ use anyhow::Result;
 use teloxide::prelude::*;
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::sync::atomic::AtomicBool;
 use tokio::sync::{mpsc, Mutex};
 
 use crate::config::Config;
@@ -49,6 +50,8 @@ pub struct BotState {
     pub executor: Arc<ExecutorService>,
     /// Per-chat pending action (waiting for user input).
     pub pending_actions: Arc<Mutex<HashMap<i64, PendingAction>>>,
+    /// Kill switch: false = auto-buy paused.
+    pub trading_active: Arc<AtomicBool>,
 }
 
 pub struct TelegramBot;
@@ -62,6 +65,7 @@ impl TelegramBot {
         wallet_manager: Arc<WalletManager>,
         wallet_password: String,
         executor: Arc<ExecutorService>,
+        trading_active: Arc<AtomicBool>,
     ) -> Result<()> {
         tracing::info!("Starting RICOZ SNIPER Telegram bot...");
 
@@ -74,6 +78,7 @@ impl TelegramBot {
             wallet_password,
             executor,
             pending_actions: Arc::new(Mutex::new(HashMap::new())),
+            trading_active,
         });
 
         let handler = dptree::entry()

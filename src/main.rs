@@ -11,6 +11,7 @@ mod telegram;
 mod wallet;
 
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use anyhow::Result;
 use teloxide::payloads::SendMessageSetters as _;
@@ -75,6 +76,9 @@ async fn main() -> Result<()> {
 
     // ── Shutdown signal channel ────────────────────────────────
     let (shutdown_tx, _) = broadcast::channel::<()>(1);
+
+    // Kill switch: shared flag to pause/resume auto-buy via Telegram /stop and /go
+    let trading_active = Arc::new(AtomicBool::new(true));
 
     // ── Trading profile from mode ────────────────────────────
     let trading_profile = config.trading_profile();
@@ -182,6 +186,7 @@ async fn main() -> Result<()> {
     let analyzer_wallet = wallet_manager.clone();
     let analyzer_password = wallet_password.clone();
     let analyzer_positions = position_manager.clone();
+    let analyzer_trading_active = trading_active.clone();
     let mut analyzer_shutdown = shutdown_tx.subscribe();
     let analyzer_handle = tokio::spawn(async move {
         info!("Analyzer pipeline starting...");
@@ -333,6 +338,16 @@ async fn main() -> Result<()> {
                             );
 
                             // Decision: Auto buy, notify, or skip
+                            // Kill switch check — /stop pauses auto-buy
+                            if !analyzer_trading_active.load(Ordering::Relaxed) {
+                                info!(
+                                    mint = %token.mint,
+                                    combined = combined_score,
+                                    "Auto-buy PAUSED (kill switch active). Use /go to resume."
+                                );
+                                continue;
+                            }
+
                             if combined_score >= analyzer_config.min_score_auto_buy {
                                 info!(
                                     mint = %token.mint,
@@ -724,7 +739,7 @@ async fn main() -> Result<()> {
     let bot_password = wallet_password.clone();
     let bot_executor = executor.clone();
     let bot_handle = tokio::spawn(async move {
-        if let Err(e) = TelegramBot::start(bot_config, bot_db, bot_sell_tx, bot_wallet, bot_password, bot_executor).await {
+        if let Err(e) = TelegramBot::start(bot_config, bot_db, bot_sell_tx, bot_wallet, bot_password, bot_executor, trading_active.clone()).await {
             error!(err = %e, "Telegram bot exited with error");
         }
     });

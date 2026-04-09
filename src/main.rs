@@ -311,26 +311,38 @@ async fn main() -> Result<()> {
                                 token.initial_liquidity_sol * sol_usd_price
                             };
 
+                            // Derive opportunity data from what PumpPortal gives us:
+                            // - initial_buy_sol > 0 means creator bought → at least 1 buyer
+                            // - if initial_buy_sol is a large % of liquidity → whale-dominated
+                            let has_creator_buy = token.initial_buy_sol > 0.0;
+                            let creator_buy_pct = if token.v_sol_in_bonding_curve > 0.0 {
+                                (token.initial_buy_sol / token.v_sol_in_bonding_curve * 100.0).min(100.0)
+                            } else if token.initial_liquidity_sol > 0.0 {
+                                (token.initial_buy_sol / token.initial_liquidity_sol * 100.0).min(100.0)
+                            } else {
+                                0.0
+                            };
+
                             let opp_analysis = crate::analyzer::opportunity::OpportunityAnalysis {
-                                buy_count: 0,             // TODO: track from gRPC stream
-                                unique_buyers: 0,         // TODO: track from gRPC stream
+                                buy_count: if has_creator_buy { 1 } else { 0 },
+                                unique_buyers: if has_creator_buy { 1 } else { 0 },
                                 seconds_since_creation: chrono::Utc::now()
                                     .signed_duration_since(token.detected_at)
                                     .num_seconds()
                                     .unsigned_abs(),
                                 liquidity_usd: effective_liq_usd,
-                                price_change_pct: 0.0,    // TODO: track price delta from gRPC
+                                price_change_pct: 0.0,  // not available from create event
                                 sol_trend_1h_pct: sol_trend,
-                                largest_buyer_pct: 0.0,   // TODO: track from gRPC
+                                largest_buyer_pct: creator_buy_pct,
                                 opportunity_score: 0,
                             };
                             let opp_score = crate::analyzer::opportunity::calculate_opportunity_score(&opp_analysis);
 
-                            // Combined score: mostly security until opportunity data is real.
-                            // Only liquidity_usd and sol_trend are real; buy_count, unique_buyers,
-                            // price_change, largest_buyer are still placeholder (0).
-                            // Weight: 90% security + 10% opportunity (bump to 60/40 when data is live).
-                            let combined_score = ((score as f64 * 0.9) + (opp_score as f64 * 0.1)).round() as u8;
+                            // Combined score: 80% security + 20% opportunity.
+                            // Real data: liquidity_usd, sol_trend, largest_buyer_pct, market_cap.
+                            // Still placeholder: buy_count (1 from creator), unique_buyers (1).
+                            // Bump to 60/40 when trade stream provides real buy_count/unique_buyers.
+                            let combined_score = ((score as f64 * 0.8) + (opp_score as f64 * 0.2)).round() as u8;
 
                             info!(
                                 mint = %token.mint,

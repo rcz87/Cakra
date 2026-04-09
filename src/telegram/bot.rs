@@ -248,6 +248,8 @@ Atur TP/SL, slippage, max buy,\ndan parameter lainnya.\n\n\
                             detected_at: Utc::now(),
                             backend: DetectionBackend::Helius,
                             market_cap_sol: 0.0,
+                            v_sol_in_bonding_curve: 0.0,
+                            initial_buy_sol: 0.0,
                         };
 
                         let slippage = state.config.default_slippage_bps;

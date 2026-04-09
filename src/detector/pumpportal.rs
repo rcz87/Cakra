@@ -152,6 +152,7 @@ fn parse_create_event(event: &serde_json::Value) -> Option<TokenInfo> {
     let bonding_curve = event["bondingCurveKey"].as_str().map(|s| s.to_string());
 
     let market_cap_sol = event["marketCapSol"].as_f64().unwrap_or(0.0);
+    let v_sol_in_bonding_curve = event["vSolInBondingCurve"].as_f64().unwrap_or(0.0);
 
     Some(TokenInfo {
         mint,
@@ -167,6 +168,8 @@ fn parse_create_event(event: &serde_json::Value) -> Option<TokenInfo> {
         detected_at: Utc::now(),
         backend: DetectionBackend::PumpPortal,
         market_cap_sol,
+        v_sol_in_bonding_curve,
+        initial_buy_sol: sol_amount,
     })
 }
 
@@ -203,6 +206,8 @@ fn parse_migration_event(event: &serde_json::Value) -> Option<TokenInfo> {
         decimals: 6,
         backend: DetectionBackend::PumpPortal,
         market_cap_sol: event["marketCapSol"].as_f64().unwrap_or(0.0),
+        v_sol_in_bonding_curve: 0.0,
+        initial_buy_sol: sol_amount,
         detected_at: Utc::now(),
     })
 }

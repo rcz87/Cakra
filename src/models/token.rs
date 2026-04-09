@@ -57,6 +57,12 @@ pub struct TokenInfo {
     /// Market cap in SOL at detection time (from PumpPortal)
     #[serde(default)]
     pub market_cap_sol: f64,
+    /// Virtual SOL reserves in bonding curve (from PumpPortal vSolInBondingCurve)
+    #[serde(default)]
+    pub v_sol_in_bonding_curve: f64,
+    /// Initial buy amount in SOL by creator (from PumpPortal solAmount on create)
+    #[serde(default)]
+    pub initial_buy_sol: f64,
 }
 
 fn default_backend() -> DetectionBackend {

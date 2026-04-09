@@ -134,84 +134,111 @@ pub fn calculate_score(
     final_score
 }
 
-/// Fast-mode score: only weights fields that were actually checked.
+/// Fast-mode score for PumpFun sniper: uses data that actually DIFFERS
+/// between tokens at launch time.
 ///
-/// In fast mode, only mint_renounced, freeze_authority, creator, LP, and
-/// liquidity are checked. The score is normalized over those weights only,
-/// so unchecked fields don't drag the score to zero.
+/// PumpFun tokens at birth ALL have: mint not renounced, freeze active,
+/// LP not burned, creator unknown. These fields are USELESS for scoring
+/// because they're identical for every token.
+///
+/// What DOES differ:
+/// - initial_buy_sol: creator's skin in the game (0.001 vs 10 SOL = huge signal)
+/// - market_cap_sol: how much SOL in the bonding curve
+/// - honeypot_result: can we actually sell this token?
+/// - rugcheck_score: third-party safety rating
+///
+/// Scoring philosophy: filter by BEHAVIOR, not by checkboxes.
 pub fn calculate_score_fast(
     analysis: &SecurityAnalysis,
     initial_liquidity_usd: f64,
     initial_liquidity_sol: f64,
     market_cap_sol: f64,
 ) -> u8 {
-    let effective_liquidity_usd = if initial_liquidity_usd > 0.0 {
-        initial_liquidity_usd
-    } else if initial_liquidity_sol > 0.0 {
-        initial_liquidity_sol * 100.0
-    } else {
-        0.0
-    };
-
-    // Only score fields that fast analyzer actually checks
-    let mint_score = if analysis.mint_renounced { 100.0 } else { 0.0 };
-    let freeze_score = if analysis.freeze_authority_null { 100.0 } else { 0.0 };
-    let creator_score = match analysis.creator_history {
-        CreatorHistory::Clean { .. } => 100.0,
-        CreatorHistory::Suspicious { .. } => 30.0,
-        CreatorHistory::Rugger { .. } => 0.0,
-        CreatorHistory::Unknown => 50.0, // neutral for fast mode, not punitive
-    };
-    let lp_score = match analysis.lp_status {
-        LpStatus::Burned => 100.0,
-        LpStatus::Locked => 80.0,
-        LpStatus::NotBurned => 20.0, // not zero — PumpFun tokens often don't lock LP
-        LpStatus::Unknown => 40.0,   // neutral, not punitive
-    };
-    let liq_usd_score = if effective_liquidity_usd >= 10_000.0 {
+    // === Signal 1: Creator's initial buy (35% weight) ===
+    // Biggest differentiator. Creator who buys 5+ SOL = serious.
+    // Creator who buys 0.01 SOL = likely rug.
+    let creator_buy_score = if initial_liquidity_sol >= 10.0 {
         100.0
-    } else if effective_liquidity_usd >= 1_000.0 {
-        50.0
-    } else if effective_liquidity_usd >= 200.0 {
+    } else if initial_liquidity_sol >= 5.0 {
+        85.0
+    } else if initial_liquidity_sol >= 2.0 {
+        65.0
+    } else if initial_liquidity_sol >= 1.0 {
+        45.0
+    } else if initial_liquidity_sol >= 0.5 {
         25.0
     } else {
-        0.0
+        5.0  // Tiny buy = very suspicious
     };
-    let mcap_score = if market_cap_sol >= 50.0 {
+
+    // === Signal 2: Market cap at detection (25% weight) ===
+    // Higher mcap = more people already bought = more momentum
+    let mcap_score = if market_cap_sol >= 80.0 {
         100.0
-    } else if market_cap_sol >= 20.0 {
-        70.0
-    } else if market_cap_sol >= 5.0 {
-        40.0
+    } else if market_cap_sol >= 50.0 {
+        80.0
+    } else if market_cap_sol >= 35.0 {
+        55.0
+    } else if market_cap_sol >= 28.0 {
+        30.0  // Base PumpFun mcap (~28 SOL) = nobody bought yet
     } else {
-        0.0
+        10.0
     };
-    let liquidity_score = f64::max(liq_usd_score, mcap_score);
 
-    // Weights for checked fields only (sum = 100)
-    const W_MINT: f64 = 25.0;
-    const W_FREEZE: f64 = 25.0;
-    const W_CREATOR: f64 = 20.0;
-    const W_LP: f64 = 15.0;
-    const W_LIQ: f64 = 15.0;
+    // === Signal 3: Honeypot check (20% weight) ===
+    // Can we actually sell? Critical for not getting trapped.
+    let honeypot_score = match analysis.honeypot_result {
+        HoneypotResult::Safe { buy_tax, sell_tax } => {
+            if buy_tax < 5.0 && sell_tax < 5.0 {
+                100.0
+            } else {
+                60.0
+            }
+        }
+        HoneypotResult::HighTax { .. } => 20.0,
+        HoneypotResult::Honeypot => 0.0,
+        HoneypotResult::Unknown => 40.0,  // Neutral — can't check on brand new tokens
+    };
 
-    let weighted = (mint_score * W_MINT
-        + freeze_score * W_FREEZE
-        + creator_score * W_CREATOR
-        + lp_score * W_LP
-        + liquidity_score * W_LIQ)
+    // === Signal 4: RugCheck score (10% weight) ===
+    let rugcheck_score = analysis.rugcheck_score.unwrap_or(50.0).clamp(0.0, 100.0);
+
+    // === Signal 5: Creator history (10% weight) ===
+    let creator_score = match analysis.creator_history {
+        CreatorHistory::Clean { tokens_created } => {
+            if tokens_created >= 3 { 100.0 } else { 70.0 }
+        }
+        CreatorHistory::Suspicious { .. } => 15.0,
+        CreatorHistory::Rugger { .. } => 0.0,
+        CreatorHistory::Unknown => 40.0,
+    };
+
+    // Weights (sum = 100)
+    const W_CREATOR_BUY: f64 = 35.0;
+    const W_MCAP: f64 = 25.0;
+    const W_HONEYPOT: f64 = 20.0;
+    const W_RUGCHECK: f64 = 10.0;
+    const W_CREATOR: f64 = 10.0;
+
+    let weighted = (creator_buy_score * W_CREATOR_BUY
+        + mcap_score * W_MCAP
+        + honeypot_score * W_HONEYPOT
+        + rugcheck_score * W_RUGCHECK
+        + creator_score * W_CREATOR)
         / 100.0;
 
     let final_score = weighted.round().clamp(0.0, 100.0) as u8;
 
     info!(
         final_score,
-        mint_score,
-        freeze_score,
+        creator_buy_score,
+        mcap_score,
+        honeypot_score,
+        rugcheck_score,
         creator_score,
-        lp_score,
-        liquidity_score,
-        "Fast score calculated (checked fields only)"
+        initial_buy_sol = initial_liquidity_sol,
+        market_cap_sol,
+        "Fast score (behavior-based)"
     );
 
     final_score

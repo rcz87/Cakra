@@ -1,10 +1,10 @@
 use anyhow::{Context, Result};
+use base64::Engine;
 use solana_sdk::signer::keypair::Keypair;
 use solana_sdk::signer::Signer;
 use tracing::{info, warn};
 
 const PUMPPORTAL_TRADE_URL: &str = "https://pumpportal.fun/api/trade-local";
-const JITO_BUNDLE_URL: &str = "https://mainnet.block-engine.jito.wtf/api/v1/bundles";
 
 /// PumpPortal trade client for building and submitting PumpFun transactions
 /// via PumpPortal's Local Trade API + Jito bundle.
@@ -77,91 +77,94 @@ impl PumpPortalTradeClient {
             anyhow::bail!("PumpPortal returned HTTP {status}: {text}");
         }
 
-        // PumpPortal returns a base58-encoded VersionedTransaction (single tx, not array)
-        let tx_base58: String = response
-            .text()
+        // PumpPortal returns raw binary (application/octet-stream) — NOT base58/JSON
+        let tx_bytes = response
+            .bytes()
             .await
-            .context("Failed to read PumpPortal response")?;
+            .context("Failed to read PumpPortal response bytes")?;
 
-        // Strip quotes if JSON string
-        let tx_base58 = tx_base58.trim().trim_matches('"');
+        info!(size = tx_bytes.len(), "PumpPortal: transaction received, signing...");
 
-        info!("PumpPortal: transaction received, signing...");
-
-        // 2. Decode, sign, re-encode
-        let tx_bytes = bs58::decode(tx_base58)
-            .into_vec()
-            .context("Failed to decode base58 transaction from PumpPortal")?;
-
-        // Deserialize as VersionedTransaction
+        // Deserialize as VersionedTransaction (raw binary / bincode)
         let mut versioned_tx: solana_sdk::transaction::VersionedTransaction =
             bincode::deserialize(&tx_bytes)
-                .context("Failed to deserialize VersionedTransaction")?;
+                .context("Failed to deserialize VersionedTransaction from PumpPortal")?;
+
+        info!(
+            num_sigs = versioned_tx.signatures.len(),
+            "PumpPortal: deserialized OK, signing..."
+        );
 
         // Sign the transaction
         let message_bytes = versioned_tx.message.serialize();
         let signature = wallet.sign_message(&message_bytes);
-        versioned_tx.signatures[0] = signature;
+
+        if versioned_tx.signatures.is_empty() {
+            versioned_tx.signatures.push(signature);
+        } else {
+            versioned_tx.signatures[0] = signature;
+        }
+
+        info!(signature = %signature, "PumpPortal: signed OK");
 
         // Get the signature string for tracking
         let sig_str = signature.to_string();
 
-        // Re-serialize for Jito
+        // Re-serialize and send via standard RPC (PumpPortal tx has its own priority fee)
         let signed_bytes = bincode::serialize(&versioned_tx)
             .context("Failed to serialize signed transaction")?;
-        let signed_base58 = bs58::encode(&signed_bytes).into_string();
+        let base64_tx = base64::engine::general_purpose::STANDARD.encode(&signed_bytes);
 
-        info!(
-            signature = %sig_str,
-            "PumpPortal: transaction signed, submitting to Jito"
-        );
+        let rpc_url = std::env::var("SOLANA_RPC_URL")
+            .unwrap_or_else(|_| "https://api.mainnet-beta.solana.com".to_string());
 
-        // 3. Submit to Jito as bundle
-        let jito_request = serde_json::json!({
+        info!(signature = %sig_str, "PumpPortal: submitting via RPC sendTransaction");
+
+        // 3. Submit via RPC sendTransaction (skipPreflight for speed)
+        let rpc_request = serde_json::json!({
             "jsonrpc": "2.0",
             "id": 1,
-            "method": "sendBundle",
-            "params": [[signed_base58]]
+            "method": "sendTransaction",
+            "params": [
+                base64_tx,
+                {
+                    "encoding": "base64",
+                    "skipPreflight": true,
+                    "maxRetries": 2
+                }
+            ]
         });
 
-        let jito_response = self
+        let rpc_response = self
             .http
-            .post(JITO_BUNDLE_URL)
+            .post(&rpc_url)
             .header("Content-Type", "application/json")
-            .json(&jito_request)
+            .json(&rpc_request)
             .send()
             .await
-            .context("Jito bundle submission failed")?;
+            .context("RPC sendTransaction failed")?;
 
-        let jito_status = jito_response.status();
-        let jito_body: serde_json::Value = jito_response
+        let rpc_body: serde_json::Value = rpc_response
             .json()
             .await
-            .context("Failed to parse Jito response")?;
+            .context("Failed to parse RPC response")?;
 
-        if !jito_status.is_success() {
-            anyhow::bail!("Jito HTTP {jito_status}: {jito_body}");
+        if let Some(err) = rpc_body.get("error") {
+            warn!(error = %err, "RPC sendTransaction error");
+            anyhow::bail!("RPC error: {err}");
         }
 
-        if let Some(err) = jito_body.get("error") {
-            anyhow::bail!("Jito error: {err}");
-        }
-
-        let bundle_id = jito_body["result"]
+        let returned_sig = rpc_body["result"]
             .as_str()
-            .unwrap_or("unknown")
+            .unwrap_or(&sig_str)
             .to_string();
 
-        info!(
-            bundle_id = %bundle_id,
-            signature = %sig_str,
-            "PumpPortal buy submitted to Jito"
-        );
+        info!(signature = %returned_sig, "PumpPortal buy sent via RPC");
 
-        // 4. Confirm bundle landed
-        let confirmation = self.confirm_jito_bundle(&bundle_id).await?;
+        // 4. Poll for confirmation
+        let confirmation = self.confirm_transaction(&returned_sig).await?;
         if !confirmation {
-            anyhow::bail!("PumpPortal buy bundle did not land (bundle_id: {bundle_id})");
+            warn!(signature = %returned_sig, "PumpPortal buy not confirmed in time — may still land");
         }
 
         Ok(sig_str)
@@ -214,15 +217,10 @@ impl PumpPortalTradeClient {
             anyhow::bail!("PumpPortal sell HTTP {status}: {text}");
         }
 
-        let tx_base58: String = response
-            .text()
+        let tx_bytes = response
+            .bytes()
             .await
-            .context("Failed to read PumpPortal sell response")?;
-        let tx_base58 = tx_base58.trim().trim_matches('"');
-
-        let tx_bytes = bs58::decode(tx_base58)
-            .into_vec()
-            .context("Failed to decode base58 sell transaction")?;
+            .context("Failed to read PumpPortal sell response bytes")?;
 
         let mut versioned_tx: solana_sdk::transaction::VersionedTransaction =
             bincode::deserialize(&tx_bytes)
@@ -236,108 +234,89 @@ impl PumpPortalTradeClient {
 
         let signed_bytes = bincode::serialize(&versioned_tx)
             .context("Failed to serialize signed sell transaction")?;
-        let signed_base58 = bs58::encode(&signed_bytes).into_string();
+        let base64_tx = base64::engine::general_purpose::STANDARD.encode(&signed_bytes);
 
-        info!(
-            signature = %sig_str,
-            "PumpPortal: sell signed, submitting to Jito"
-        );
+        let rpc_url = std::env::var("SOLANA_RPC_URL")
+            .unwrap_or_else(|_| "https://api.mainnet-beta.solana.com".to_string());
 
-        let jito_request = serde_json::json!({
+        info!(signature = %sig_str, "PumpPortal: sell submitting via RPC");
+
+        let rpc_request = serde_json::json!({
             "jsonrpc": "2.0",
             "id": 1,
-            "method": "sendBundle",
-            "params": [[signed_base58]]
+            "method": "sendTransaction",
+            "params": [
+                base64_tx,
+                {
+                    "encoding": "base64",
+                    "skipPreflight": true,
+                    "maxRetries": 2
+                }
+            ]
         });
 
-        let jito_response = self
+        let rpc_response = self
             .http
-            .post(JITO_BUNDLE_URL)
+            .post(&rpc_url)
             .header("Content-Type", "application/json")
-            .json(&jito_request)
+            .json(&rpc_request)
             .send()
             .await
-            .context("Jito sell bundle submission failed")?;
+            .context("RPC sell sendTransaction failed")?;
 
-        let jito_body: serde_json::Value = jito_response
+        let rpc_body: serde_json::Value = rpc_response
             .json()
             .await
-            .context("Failed to parse Jito sell response")?;
+            .context("Failed to parse RPC sell response")?;
 
-        if let Some(err) = jito_body.get("error") {
-            anyhow::bail!("Jito sell error: {err}");
+        if let Some(err) = rpc_body.get("error") {
+            anyhow::bail!("RPC sell error: {err}");
         }
 
-        let bundle_id = jito_body["result"]
+        let returned_sig = rpc_body["result"]
             .as_str()
-            .unwrap_or("unknown")
+            .unwrap_or(&sig_str)
             .to_string();
 
-        info!(
-            bundle_id = %bundle_id,
-            signature = %sig_str,
-            "PumpPortal sell submitted to Jito"
-        );
+        info!(signature = %returned_sig, "PumpPortal sell sent via RPC");
 
-        let confirmation = self.confirm_jito_bundle(&bundle_id).await?;
+        let confirmation = self.confirm_transaction(&returned_sig).await?;
         if !confirmation {
-            anyhow::bail!("PumpPortal sell bundle did not land (bundle_id: {bundle_id})");
+            warn!(signature = %returned_sig, "PumpPortal sell not confirmed in time");
         }
 
-        Ok(sig_str)
+        Ok(returned_sig)
     }
 
-    /// Poll Jito for bundle confirmation (up to 60s).
-    async fn confirm_jito_bundle(&self, bundle_id: &str) -> Result<bool> {
-        let deadline =
-            tokio::time::Instant::now() + std::time::Duration::from_secs(60);
+    /// Poll for transaction confirmation via RPC (up to 60s).
+    async fn confirm_transaction(&self, signature: &str) -> Result<bool> {
+        let rpc_url = std::env::var("SOLANA_RPC_URL")
+            .unwrap_or_else(|_| "https://api.mainnet-beta.solana.com".to_string());
+
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(60);
         let poll_interval = std::time::Duration::from_millis(1500);
 
         loop {
             if tokio::time::Instant::now() >= deadline {
-                warn!(bundle_id = %bundle_id, "PumpPortal bundle confirmation timed out");
+                warn!(signature = %signature, "Transaction confirmation timed out");
                 return Ok(false);
             }
 
-            let status_request = serde_json::json!({
+            let status_req = serde_json::json!({
                 "jsonrpc": "2.0",
                 "id": 1,
-                "method": "getBundleStatuses",
-                "params": [[bundle_id]]
+                "method": "getSignatureStatuses",
+                "params": [[signature]]
             });
 
-            if let Ok(response) = self
-                .http
-                .post(JITO_BUNDLE_URL)
-                .json(&status_request)
-                .send()
-                .await
-            {
+            if let Ok(response) = self.http.post(&rpc_url).json(&status_req).send().await {
                 if let Ok(body) = response.json::<serde_json::Value>().await {
-                    if let Some(entries) = body["result"]["value"].as_array() {
-                        for entry in entries {
-                            if entry["bundle_id"].as_str() == Some(bundle_id) {
-                                match entry["status"].as_str() {
-                                    Some("Landed") | Some("Finalized") => {
-                                        info!(
-                                            bundle_id = %bundle_id,
-                                            status = %entry["status"],
-                                            "PumpPortal bundle confirmed on-chain"
-                                        );
-                                        return Ok(true);
-                                    }
-                                    Some("Failed") | Some("Invalid") => {
-                                        warn!(
-                                            bundle_id = %bundle_id,
-                                            status = %entry["status"],
-                                            "PumpPortal bundle rejected"
-                                        );
-                                        return Ok(false);
-                                    }
-                                    _ => {} // Still pending
-                                }
-                            }
-                        }
+                    let status = body["result"]["value"][0]["confirmationStatus"]
+                        .as_str()
+                        .unwrap_or("pending");
+                    if status == "confirmed" || status == "finalized" {
+                        info!(signature = %signature, status = %status, "Transaction confirmed");
+                        return Ok(true);
                     }
                 }
             }

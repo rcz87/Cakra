@@ -52,6 +52,8 @@ impl PriceFeed {
     }
 
     /// Fetch token decimals from on-chain mint account, using a local cache.
+    /// Falls back to 6 decimals for PumpFun tokens (Token-2022 mint accounts
+    /// can't be deserialized with spl_token::state::Mint::unpack).
     fn get_decimals(&self, mint: &str) -> Result<u8> {
         // Check cache first
         if let Some(&d) = self.decimals_cache.lock().unwrap().get(mint) {
@@ -59,14 +61,35 @@ impl PriceFeed {
         }
 
         let pubkey = Pubkey::from_str(mint).context("Invalid mint pubkey")?;
-        let account = self
-            .rpc
-            .get_account(&pubkey)
-            .with_context(|| format!("Failed to fetch mint account for {}", mint))?;
-        let mint_state = Mint::unpack(&account.data)
-            .with_context(|| format!("Failed to deserialize mint account for {}", mint))?;
 
-        let decimals = mint_state.decimals;
+        let decimals = match self.rpc.get_account(&pubkey) {
+            Ok(account) => {
+                // Try standard SPL Token unpack first
+                match Mint::unpack(&account.data) {
+                    Ok(mint_state) => mint_state.decimals,
+                    Err(_) => {
+                        // Token-2022 or other program — try reading decimals from raw data.
+                        // SPL Token mint layout: decimals is at offset 44 (1 byte) for both
+                        // Token and Token-2022 programs.
+                        if account.data.len() >= 45 {
+                            let d = account.data[44];
+                            info!(mint = %mint, decimals = d, "Decimals from raw data (Token-2022)");
+                            d
+                        } else {
+                            // PumpFun tokens are always 6 decimals
+                            info!(mint = %mint, "Using default 6 decimals (unpack failed)");
+                            6
+                        }
+                    }
+                }
+            }
+            Err(_) => {
+                // RPC error — default to 6 for PumpFun tokens
+                info!(mint = %mint, "Mint account fetch failed, using 6 decimals");
+                6
+            }
+        };
+
         self.decimals_cache
             .lock()
             .unwrap()

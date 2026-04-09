@@ -545,6 +545,45 @@ impl ExecutorService {
         Ok(signature)
     }
 
+    /// Get token balance for a wallet, works for both Token and Token-2022 programs.
+    /// Uses RPC getTokenAccountsByOwner with jsonParsed encoding.
+    fn get_token_balance_for_mint(
+        &self,
+        wallet_pubkey: &Pubkey,
+        mint_str: &str,
+    ) -> Result<u64> {
+        use solana_client::rpc_request::TokenAccountsFilter;
+
+        let mint_pubkey: Pubkey = mint_str.parse().context("Invalid mint")?;
+
+        let accounts = self
+            .rpc
+            .get_token_accounts_by_owner(
+                wallet_pubkey,
+                TokenAccountsFilter::Mint(mint_pubkey),
+            )
+            .context("Failed to get token accounts by owner")?;
+
+        if accounts.is_empty() {
+            return Ok(0);
+        }
+
+        // Parse balance from the keyed account response
+        let mut total: u64 = 0;
+        for account in &accounts {
+            // The account data is jsonParsed by default from get_token_accounts_by_owner
+            let data_str = serde_json::to_string(&account.account.data)
+                .unwrap_or_default();
+            if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(&data_str) {
+                if let Some(amount_str) = parsed["parsed"]["info"]["tokenAmount"]["amount"].as_str() {
+                    total += amount_str.parse::<u64>().unwrap_or(0);
+                }
+            }
+        }
+
+        Ok(total)
+    }
+
     /// Verify on-chain token balance after a buy, with retries.
     async fn verify_buy_balance(
         &self,
@@ -552,32 +591,14 @@ impl ExecutorService {
         mint_str: &str,
         expected_output: u64,
     ) -> Result<u64> {
-        let mint_pubkey: Pubkey = mint_str.parse().context("Invalid mint")?;
-        let token_program: Pubkey = "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA"
-            .parse()
-            .unwrap();
-        let ata_program: Pubkey = "ATokenGPvbdGVxr1b2hvZbsiqW5xWH25efTNsLJA8knL"
-            .parse()
-            .unwrap();
-        let (ata, _) = Pubkey::find_program_address(
-            &[
-                wallet.pubkey().as_ref(),
-                token_program.as_ref(),
-                mint_pubkey.as_ref(),
-            ],
-            &ata_program,
-        );
-
         for attempt in 0..3u32 {
             if attempt > 0 {
                 tokio::time::sleep(std::time::Duration::from_secs(1 << attempt)).await;
             }
-            match self.rpc.get_token_account_balance(&ata) {
-                Ok(balance) => {
-                    let bal: u64 = balance.amount.parse().unwrap_or(0);
-                    if bal > 0 {
-                        return Ok(bal);
-                    }
+            match self.get_token_balance_for_mint(&wallet.pubkey(), mint_str) {
+                Ok(bal) if bal > 0 => return Ok(bal),
+                Ok(_) => {
+                    warn!(mint = %mint_str, attempt = attempt + 1, "Balance is 0, retrying");
                 }
                 Err(e) => {
                     warn!(mint = %mint_str, attempt = attempt + 1, error = %e, "Balance check retry");
@@ -585,7 +606,7 @@ impl ExecutorService {
             }
         }
 
-        Ok(expected_output) // Fallback to expected if verification fails
+        Ok(expected_output)
     }
 
     /// Execute a sell for a given token mint. Sells `amount_pct`% of holdings.
@@ -609,31 +630,10 @@ impl ExecutorService {
         let wsol_mint = "So11111111111111111111111111111111111111112";
         let taker = wallet.pubkey().to_string();
 
-        // Get token balance to calculate sell amount
-        let mint_pubkey: Pubkey = mint.parse().context("Invalid mint address")?;
-        let token_program: Pubkey = "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA"
-            .parse()
-            .unwrap();
-        let ata_program: Pubkey = "ATokenGPvbdGVxr1b2hvZbsiqW5xWH25efTNsLJA8knL"
-            .parse()
-            .unwrap();
-        let (ata, _) = Pubkey::find_program_address(
-            &[
-                wallet.pubkey().as_ref(),
-                token_program.as_ref(),
-                mint_pubkey.as_ref(),
-            ],
-            &ata_program,
-        );
-
-        let balance = self
-            .rpc
-            .get_token_account_balance(&ata)
+        // Get token balance to calculate sell amount (works for Token + Token-2022)
+        let total_amount = self
+            .get_token_balance_for_mint(&wallet.pubkey(), mint)
             .context("Failed to get token balance for sell")?;
-        let total_amount: u64 = balance
-            .amount
-            .parse()
-            .context("Failed to parse token balance")?;
 
         if total_amount == 0 {
             anyhow::bail!("Token balance is zero for mint {mint}");
@@ -741,7 +741,7 @@ impl ExecutorService {
 
         // 6. Verify sell outcome via balance check + signature polling fallback
         let sell_verified = self.verify_sell_outcome(
-            mint, &signature, &ata, total_amount,
+            mint, &signature, &wallet.pubkey(), total_amount,
         ).await;
 
         let (post_balance, actual_sold, actual_sell_pct) = match sell_verified {
@@ -831,7 +831,7 @@ impl ExecutorService {
         &self,
         mint: &str,
         signature: &str,
-        ata: &Pubkey,
+        wallet_pubkey: &Pubkey,
         pre_balance: u64,
     ) -> SellOutcome {
         // Phase 1: Try balance check 3x with exponential backoff
@@ -840,9 +840,8 @@ impl ExecutorService {
                 let delay = std::time::Duration::from_secs(1 << attempt);
                 tokio::time::sleep(delay).await;
             }
-            match self.rpc.get_token_account_balance(ata) {
-                Ok(b) => {
-                    let post = b.amount.parse::<u64>().unwrap_or(0);
+            match self.get_token_balance_for_mint(wallet_pubkey, mint) {
+                Ok(post) => {
                     if post < pre_balance {
                         let actual_sold = pre_balance - post;
                         let pct = ((actual_sold as f64 / pre_balance as f64) * 100.0) as u8;
@@ -908,8 +907,7 @@ impl ExecutorService {
                             );
                             // Tx confirmed — try one more balance check
                             tokio::time::sleep(std::time::Duration::from_secs(1)).await;
-                            if let Ok(b) = self.rpc.get_token_account_balance(ata) {
-                                let post = b.amount.parse::<u64>().unwrap_or(0);
+                            if let Ok(post) = self.get_token_balance_for_mint(wallet_pubkey, mint) {
                                 if post < pre_balance {
                                     let actual_sold = pre_balance - post;
                                     let pct = ((actual_sold as f64 / pre_balance as f64) * 100.0) as u8;

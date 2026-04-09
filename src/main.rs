@@ -326,8 +326,11 @@ async fn main() -> Result<()> {
                             };
                             let opp_score = crate::analyzer::opportunity::calculate_opportunity_score(&opp_analysis);
 
-                            // Combined score: 60% security + 40% opportunity
-                            let combined_score = ((score as f64 * 0.6) + (opp_score as f64 * 0.4)).round() as u8;
+                            // Combined score: mostly security until opportunity data is real.
+                            // Only liquidity_usd and sol_trend are real; buy_count, unique_buyers,
+                            // price_change, largest_buyer are still placeholder (0).
+                            // Weight: 90% security + 10% opportunity (bump to 60/40 when data is live).
+                            let combined_score = ((score as f64 * 0.9) + (opp_score as f64 * 0.1)).round() as u8;
 
                             info!(
                                 mint = %token.mint,
@@ -349,9 +352,23 @@ async fn main() -> Result<()> {
                             }
 
                             if combined_score >= analyzer_config.min_score_auto_buy {
+                                // Sanity check: reject tokens with no liquidity data at all
+                                if token.initial_liquidity_sol <= 0.0 && token.market_cap_sol <= 0.0 {
+                                    warn!(
+                                        mint = %token.mint,
+                                        combined = combined_score,
+                                        "Rejected: zero liquidity AND zero market cap — no data to trade on"
+                                    );
+                                    continue;
+                                }
+
                                 info!(
                                     mint = %token.mint,
-                                    score = score,
+                                    combined = combined_score,
+                                    security = score,
+                                    opportunity = opp_score,
+                                    liq_sol = token.initial_liquidity_sol,
+                                    mcap_sol = token.market_cap_sol,
                                     "Score >= {} \u{2192} AUTO BUY",
                                     analyzer_config.min_score_auto_buy
                                 );

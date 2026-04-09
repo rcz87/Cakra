@@ -514,39 +514,16 @@ async fn main() -> Result<()> {
                                     }
                                 }
                             } else if combined_score >= analyzer_config.min_score_notify {
+                                // Log only — no Telegram spam for NOTIFY tier
                                 info!(
                                     mint = %token.mint,
-                                    score = score,
-                                    "Score {}-{} \u{2192} NOTIFY user",
+                                    combined = combined_score,
+                                    security = score,
+                                    liq_sol = token.initial_liquidity_sol,
+                                    "Score {}-{} \u{2192} NOTIFY (log only)",
                                     analyzer_config.min_score_notify,
                                     analyzer_config.min_score_auto_buy
                                 );
-
-                                // Send notification with buy buttons
-                                let lp_status = format!("{:?}", analysis.lp_status);
-                                let honeypot = format!("{:?}", analysis.honeypot_result);
-                                let _ = tg_bot.send_message(
-                                    tg_chat,
-                                    format!(
-                                        "\u{1f50d} <b>Token Detected</b>\n\
-                                         \u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\n\n\
-                                         \u{1f4e6} <b>{}</b> (<code>{}</code>)\n\
-                                         \u{1f30d} Source: {}\n\
-                                         \u{1f6e1}\u{fe0f} Score: <b>{}/100</b>\n\
-                                         \u{1f4b0} Liquidity: {:.2} SOL\n\
-                                         \u{1f512} LP: {}\n\
-                                         \u{1f41d} Honeypot: {}\n\n\
-                                         \u{1f4a1} <i>Score di bawah auto-buy ({}).\nGunakan /buy {} untuk beli manual.</i>",
-                                        token.symbol, token.mint,
-                                        token.source,
-                                        score,
-                                        token.initial_liquidity_sol,
-                                        lp_status,
-                                        honeypot,
-                                        analyzer_config.min_score_auto_buy,
-                                        token.mint,
-                                    ),
-                                ).parse_mode(teloxide::types::ParseMode::Html).await;
                             } else {
                                 info!(
                                     mint = %token.mint,

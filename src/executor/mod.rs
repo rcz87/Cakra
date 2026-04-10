@@ -207,6 +207,12 @@ impl ExecutorService {
                 liquidity_sol: token.initial_liquidity_sol,
                 spot_price_sol: spot_price,
                 wallet_sol_at_observation: wallet_sol_at_open,
+                // Migration fields default false (this path is for new tokens, not migrations)
+                is_migration: false,
+                migration_pool: None,
+                pre_migration_v_sol: None,
+                filter_passed: true,  // it reached buy phase, so it passed all filters
+                filter_reason: None,
             };
 
             info!(

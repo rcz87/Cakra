@@ -344,6 +344,12 @@ pub struct Observation {
     pub liquidity_sol: f64,
     pub spot_price_sol: f64,
     pub wallet_sol_at_observation: f64,
+    // Migration sniping fields
+    pub is_migration: bool,
+    pub migration_pool: Option<String>,
+    pub pre_migration_v_sol: Option<f64>,
+    pub filter_passed: bool,
+    pub filter_reason: Option<String>,
 }
 
 pub fn insert_observation(db: &DbPool, obs: &Observation) -> Result<()> {
@@ -352,8 +358,9 @@ pub fn insert_observation(db: &DbPool, obs: &Observation) -> Result<()> {
         "INSERT INTO observations \
          (id, mint, symbol, source, security_score, opportunity_score, combined_score, \
           route_type, expected_output, market_cap_sol, liquidity_sol, spot_price_sol, \
-          wallet_sol_at_observation, observed_at) \
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)",
+          wallet_sol_at_observation, observed_at, \
+          is_migration, migration_pool, pre_migration_v_sol, filter_passed, filter_reason) \
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19)",
         params![
             obs.id,
             obs.mint,
@@ -369,6 +376,11 @@ pub fn insert_observation(db: &DbPool, obs: &Observation) -> Result<()> {
             obs.spot_price_sol,
             obs.wallet_sol_at_observation,
             chrono::Utc::now().to_rfc3339(),
+            obs.is_migration as i32,
+            obs.migration_pool,
+            obs.pre_migration_v_sol,
+            obs.filter_passed as i32,
+            obs.filter_reason,
         ],
     )?;
     Ok(())

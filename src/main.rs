@@ -278,7 +278,93 @@ async fn main() -> Result<()> {
                         }
                     }
 
-                    // Store token in database
+                    // ── MIGRATION SNIPING OBSERVATION PIPELINE ───────────
+                    // Detect migration events using sentinel marker set by
+                    // pumpportal::parse_migration_event. Reliable than checking
+                    // creator.is_empty() because parse failures could also produce
+                    // empty creator and become false positives.
+                    //
+                    // Apply migration-specific filters and record observations.
+                    // Skip the normal scoring pipeline for these — they need
+                    // different validation.
+                    let is_migration_event = token.creator
+                        == crate::detector::pumpportal::MIGRATION_EVENT_MARKER;
+
+                    if is_migration_event {
+                        let pool_str = match token.source {
+                            crate::models::token::TokenSource::PumpSwap => "pump-amm",
+                            crate::models::token::TokenSource::Raydium => "raydium",
+                            _ => "unknown",
+                        };
+
+                        // ── Migration filters ────────────────────────────
+                        // Filter 1: minimum migration liquidity > 50 SOL
+                        // Filter 2: not the "creator buy exactly 3 SOL" launcher pattern
+                        //           (heuristic: solAmount close to 3.0 = mass launcher default)
+                        // Filter 3: market_cap_sol indicates real graduation (>= 350 SOL)
+                        let mut filter_passed = true;
+                        let mut filter_reason: Option<String> = None;
+
+                        if token.initial_liquidity_sol < 50.0 {
+                            filter_passed = false;
+                            filter_reason = Some(format!(
+                                "liquidity {:.1} SOL < 50.0 min",
+                                token.initial_liquidity_sol
+                            ));
+                        } else if (token.initial_liquidity_sol - 3.0).abs() < 0.1 {
+                            filter_passed = false;
+                            filter_reason = Some("default launcher pattern (creator ~3 SOL)".to_string());
+                        } else if token.market_cap_sol > 0.0 && token.market_cap_sol < 350.0 {
+                            filter_passed = false;
+                            filter_reason = Some(format!(
+                                "mcap {:.1} SOL < 350 (incomplete migration)",
+                                token.market_cap_sol
+                            ));
+                        }
+
+                        info!(
+                            mint = %token.mint,
+                            symbol = %token.symbol,
+                            pool = %pool_str,
+                            liquidity_sol = token.initial_liquidity_sol,
+                            mcap_sol = token.market_cap_sol,
+                            filter_passed,
+                            filter_reason = ?filter_reason,
+                            "MIGRATION EVENT observed"
+                        );
+
+                        // Record observation regardless of filter outcome
+                        // (so we can analyze rejection patterns later)
+                        let observation = db::queries::Observation {
+                            id: uuid::Uuid::new_v4().to_string(),
+                            mint: token.mint.clone(),
+                            symbol: token.symbol.clone(),
+                            source: format!("{:?}", token.source),
+                            security_score: 0,
+                            opportunity_score: 0,
+                            combined_score: 0,
+                            route_type: "migration".to_string(),
+                            expected_output: 0,
+                            market_cap_sol: token.market_cap_sol,
+                            liquidity_sol: token.initial_liquidity_sol,
+                            spot_price_sol: 0.0,
+                            wallet_sol_at_observation: 0.0,
+                            is_migration: true,
+                            migration_pool: Some(pool_str.to_string()),
+                            pre_migration_v_sol: None,  // not available from migration event
+                            filter_passed,
+                            filter_reason,
+                        };
+
+                        if let Err(e) = db::queries::insert_observation(&analyzer_db, &observation) {
+                            warn!(error = %e, "Failed to record migration observation");
+                        }
+
+                        // Migration events don't go through normal scoring pipeline
+                        continue;
+                    }
+
+                    // Store token in database (non-migration tokens only)
                     if let Err(e) = db::queries::insert_token(&analyzer_db, &token) {
                         warn!(error = %e, "Failed to store token in database");
                     }

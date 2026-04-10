@@ -164,6 +164,17 @@ fn run_migrations(conn: &Connection) -> Result<()> {
         // Migration 003: realized PnL via wallet snapshot
         ("003_positions_wallet_sol_at_open",
          "ALTER TABLE positions ADD COLUMN wallet_sol_at_open REAL NOT NULL DEFAULT 0"),
+        // Migration 004: migration sniping observations
+        ("004_observations_is_migration",
+         "ALTER TABLE observations ADD COLUMN is_migration INTEGER NOT NULL DEFAULT 0"),
+        ("004_observations_migration_pool",
+         "ALTER TABLE observations ADD COLUMN migration_pool TEXT"),
+        ("004_observations_pre_migration_v_sol",
+         "ALTER TABLE observations ADD COLUMN pre_migration_v_sol REAL"),
+        ("004_observations_filter_passed",
+         "ALTER TABLE observations ADD COLUMN filter_passed INTEGER NOT NULL DEFAULT 0"),
+        ("004_observations_filter_reason",
+         "ALTER TABLE observations ADD COLUMN filter_reason TEXT"),
     ];
 
     for (name, sql) in migrations {

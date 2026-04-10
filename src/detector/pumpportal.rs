@@ -173,7 +173,13 @@ fn parse_create_event(event: &serde_json::Value) -> Option<TokenInfo> {
     })
 }
 
+/// Sentinel value used in TokenInfo.creator to mark a migration event.
+/// Allows reliable downstream detection without fragile empty-string checks.
+pub const MIGRATION_EVENT_MARKER: &str = "MIGRATION_EVENT";
+
 /// Parse a PumpPortal "migration" event into TokenInfo.
+/// Sets creator = MIGRATION_EVENT_MARKER so downstream pipelines can
+/// identify this as a migration vs a fresh launch reliably.
 fn parse_migration_event(event: &serde_json::Value) -> Option<TokenInfo> {
     let mint = event["mint"].as_str()?.to_string();
     let pool = event["pool"].as_str().unwrap_or("pump-amm").to_string();
@@ -198,7 +204,7 @@ fn parse_migration_event(event: &serde_json::Value) -> Option<TokenInfo> {
         name,
         symbol,
         source,
-        creator: String::new(),
+        creator: MIGRATION_EVENT_MARKER.to_string(),
         initial_liquidity_sol: sol_amount,
         initial_liquidity_usd: 0.0,
         pool_address,

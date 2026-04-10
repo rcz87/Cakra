@@ -255,6 +255,12 @@ impl PositionManager {
     /// Without this guard, a successful TP close followed by an echo sell
     /// command (TP/SL monitor still cycling) would clobber the ClosedTp
     /// status with ClosedError, even though the trade made profit.
+    ///
+    /// IMPORTANT: also clears pnl_sol/pnl_pct to 0. The position has stale
+    /// spot-price-based fantasy PnL from update_pnl() calls — but the sell
+    /// FAILED, so nothing was realized. The token is still in the wallet,
+    /// value unknown. Showing the fantasy PnL inflates /stats with fake
+    /// winners (e.g. $PVE +407% that never sold).
     pub fn close_position_error(&self, mint: &str) -> Result<()> {
         let already_closed = {
             let positions = self
@@ -273,6 +279,25 @@ impl PositionManager {
                 "close_position_error called on already-closed position — skipping (preserving prior status)"
             );
             return Ok(());
+        }
+
+        // Clear fantasy PnL before marking error
+        {
+            let mut positions = self
+                .positions
+                .write()
+                .map_err(|e| anyhow::anyhow!("Position lock poisoned: {e}"))?;
+            if let Some(pos) = positions.get_mut(mint) {
+                if pos.pnl_sol != 0.0 {
+                    info!(
+                        mint = %mint,
+                        cleared_pnl = pos.pnl_sol,
+                        "Clearing fantasy PnL on ClosedError (sell never realized)"
+                    );
+                    pos.pnl_sol = 0.0;
+                    pos.pnl_pct = 0.0;
+                }
+            }
         }
 
         self.close_position_with_status(mint, "sell_failed", PositionStatus::ClosedError)

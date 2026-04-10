@@ -19,6 +19,9 @@ pub enum RouteType {
     PumpFun,
     /// Jupiter aggregator (covers all DEXes)
     Jupiter,
+    /// Direct Raydium CPMM swap (Sprint 3b — gated by ENABLE_RAYDIUM_DIRECT)
+    /// Used when Jupiter has no route for a fresh Raydium pool.
+    RaydiumDirect,
 }
 
 /// A swap route with pricing information.
@@ -174,7 +177,28 @@ pub async fn find_best_route(
         }
     }
 
-    // 2. PumpFun-only fallback: if Jupiter had no route AND token is still on bonding curve
+    // 2. Sprint 3b: Raydium direct fallback for fresh Raydium pools (gated by config flag)
+    if matches!(token.source, TokenSource::Raydium) && config.enable_raydium_direct {
+        info!(
+            mint = %token.mint,
+            age_secs = token_age_secs,
+            "Raydium token + Jupiter failed → trying RaydiumDirect (CPMM)"
+        );
+
+        if token.pool_address.is_some() {
+            let route = Route {
+                route_type: RouteType::RaydiumDirect,
+                expected_output: 0,  // computed downstream after vault read
+                min_output: 0,       // computed downstream
+                price_impact_pct: 0.0,
+            };
+            return Ok(route);
+        } else {
+            warn!("Raydium token has no pool_address — cannot use RaydiumDirect");
+        }
+    }
+
+    // 3. PumpFun-only fallback: if Jupiter had no route AND token is still on bonding curve
     //    (PumpFun source, not PumpSwap), try direct bonding curve buy.
     //    PumpSwap is excluded — it's an AMM pool, not bonding curve. Wrong math.
     if matches!(token.source, TokenSource::PumpFun) && token_age_secs < PUMPFUN_FALLBACK_AGE_SECS {

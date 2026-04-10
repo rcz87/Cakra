@@ -357,6 +357,40 @@ impl ExecutorService {
                     }
                 }
             }
+            RouteType::RaydiumDirect => {
+                // Sprint 3b: Direct Raydium CPMM swap (gated by ENABLE_RAYDIUM_DIRECT)
+                let pool_address = token.pool_address.as_ref()
+                    .context("RaydiumDirect requires pool_address on token")?;
+
+                let meta = raydium::load_pool_meta(&self.rpc, pool_address)
+                    .context("Failed to load Raydium pool meta for direct swap")?;
+
+                // Compute minimum output from current reserves + slippage
+                let (sol_reserves, token_reserves) = raydium::read_reserves(&self.rpc, &meta)
+                    .context("Failed to read pool reserves")?;
+                let expected_token_out = raydium::quote_buy_exact_in(
+                    amount_lamports, sol_reserves, token_reserves
+                );
+                let min_token_out = (expected_token_out as u128
+                    * (10_000 - slippage_bps as u128) / 10_000) as u64;
+
+                info!(
+                    mint = %token.mint,
+                    pool = %meta.pool,
+                    sol_in = amount_lamports,
+                    expected_out = expected_token_out,
+                    min_out = min_token_out,
+                    "Building RaydiumDirect buy"
+                );
+
+                let raydium_ixs = raydium::build_raydium_buy_instructions(
+                    &meta, &wallet.pubkey(), amount_lamports, min_token_out,
+                ).context("Failed to build Raydium buy instructions")?;
+
+                for ix in raydium_ixs {
+                    instructions.push(ix);
+                }
+            }
         }
 
         // Add Helius Sender tip to instructions (for dual routing)
@@ -673,17 +707,15 @@ impl ExecutorService {
             anyhow::bail!("Calculated sell amount is zero");
         }
 
-        // ── Source-aware sell routing (Sprint 3a) ──────────────
-        // Look up the position to learn its source. If we have an open position
-        // tagged as PumpFun/PumpSwap, prefer PumpPortal sell. Everything else
-        // (Raydium, Mature, Unknown) goes through Jupiter for now.
-        // Sprint 3b will add direct Raydium swap as Jupiter fallback for fresh pools.
-        let pos_source = self
+        // ── Source-aware sell routing (Sprint 3a + 3b) ──────────────
+        // Look up the position to learn its source.
+        let pos = self
             .positions
             .get_open_positions()
             .into_iter()
-            .find(|p| p.token_mint == mint)
-            .map(|p| p.token_source);
+            .find(|p| p.token_mint == mint);
+        let pos_source = pos.as_ref().map(|p| p.token_source.clone());
+        let pos_pool = pos.as_ref().and_then(|p| p.pool_address.clone());
 
         let use_pumpportal = matches!(
             pos_source.as_deref(),
@@ -699,6 +731,31 @@ impl ExecutorService {
             return self.execute_sell_via_pumpportal(
                 mint, amount_pct, wallet, pos_source.as_deref().unwrap_or("PumpFun"),
             ).await;
+        }
+
+        // Sprint 3b: Try Raydium direct sell if enabled, source is Raydium, and pool known
+        if self.config.enable_raydium_direct
+            && matches!(pos_source.as_deref(), Some("Raydium"))
+            && pos_pool.is_some()
+        {
+            info!(
+                mint = %mint,
+                pool = ?pos_pool,
+                "Sell route: RaydiumDirect (source-aware, gated)"
+            );
+            // Try direct, fall through to Jupiter on error
+            match self.execute_sell_via_raydium_direct(
+                mint, amount_pct, wallet, pos_pool.as_deref().unwrap(), sell_amount,
+            ).await {
+                Ok(sig) => return Ok(sig),
+                Err(e) => {
+                    warn!(
+                        mint = %mint,
+                        error = %e,
+                        "RaydiumDirect sell failed, falling back to Jupiter"
+                    );
+                }
+            }
         }
 
         info!(
@@ -980,6 +1037,145 @@ impl ExecutorService {
         };
         if let Err(e) = db::queries::insert_trade(&self.db, &trade) {
             warn!(error = %e, "Failed to record PumpPortal sell trade");
+        }
+
+        Ok(signature)
+    }
+
+    /// Sprint 3b: Sell via direct Raydium CPMM swap.
+    /// Builds the instruction sequence locally and submits via Helius Sender.
+    /// Falls through to caller (Jupiter fallback) on any error.
+    async fn execute_sell_via_raydium_direct(
+        &self,
+        mint: &str,
+        amount_pct: u8,
+        wallet: &Keypair,
+        pool_address: &str,
+        sell_amount: u64,
+    ) -> Result<String> {
+        let pre_balance = self
+            .get_token_balance_for_mint(&wallet.pubkey(), mint)
+            .context("Failed to get token balance for RaydiumDirect sell")?;
+
+        if pre_balance == 0 {
+            anyhow::bail!("Token balance is zero");
+        }
+
+        let meta = raydium::load_pool_meta(&self.rpc, pool_address)
+            .context("Failed to load Raydium pool meta")?;
+
+        // Read reserves to compute minimum SOL out with slippage
+        let (sol_reserves, token_reserves) = raydium::read_reserves(&self.rpc, &meta)?;
+        let expected_sol_out = raydium::quote_sell_exact_in(
+            sell_amount, sol_reserves, token_reserves
+        );
+        let slippage_bps = self.config.default_slippage_bps as u128;
+        let min_sol_out = (expected_sol_out as u128 * (10_000 - slippage_bps) / 10_000) as u64;
+
+        info!(
+            mint = %mint,
+            pool = %meta.pool,
+            token_in = sell_amount,
+            expected_sol = expected_sol_out,
+            min_sol = min_sol_out,
+            "Building RaydiumDirect sell"
+        );
+
+        let mut instructions = raydium::build_raydium_sell_instructions(
+            &meta, &wallet.pubkey(), sell_amount, min_sol_out,
+        )?;
+
+        // Add Helius Sender tip
+        instructions.push(
+            HeliusSender::build_tip_instruction(
+                &wallet.pubkey(),
+                self.config.jito_tip_lamports,
+            )?
+        );
+
+        let recent_blockhash = self
+            .rpc
+            .get_latest_blockhash()
+            .context("Failed to get blockhash for Raydium sell")?;
+        let blockhash_fetched = std::time::Instant::now();
+
+        let swap_tx = Transaction::new_signed_with_payer(
+            &instructions,
+            Some(&wallet.pubkey()),
+            &[wallet],
+            recent_blockhash,
+        );
+
+        if blockhash_fetched.elapsed().as_secs() >= 60 {
+            anyhow::bail!("Blockhash stale for Raydium sell");
+        }
+
+        let serialized = bincode::serialize(&swap_tx)
+            .context("Failed to serialize Raydium sell tx")?;
+
+        let signature = self
+            .sender
+            .send_and_confirm(&serialized, 60)
+            .await
+            .context("Helius Sender Raydium sell failed")?;
+
+        info!(
+            mint = %mint,
+            signature = %signature,
+            "RaydiumDirect sell submitted"
+        );
+
+        // Verify outcome
+        let outcome = self
+            .verify_sell_outcome(mint, &signature, &wallet.pubkey(), pre_balance)
+            .await;
+
+        let (post_balance, _actual_sold, actual_sell_pct) = match outcome {
+            SellOutcome::BalanceReduced { post_balance, actual_sold, actual_sell_pct } => {
+                info!(
+                    mint = %mint,
+                    pre_balance,
+                    post_balance,
+                    actual_sold,
+                    "RaydiumDirect sell verified"
+                );
+                (post_balance, actual_sold, actual_sell_pct)
+            }
+            SellOutcome::SignatureConfirmed => {
+                warn!(mint = %mint, signature = %signature, "Sell tx confirmed but balance ambiguous");
+                (0, pre_balance, 100)
+            }
+            SellOutcome::Failed(reason) => {
+                anyhow::bail!("RaydiumDirect sell verification failed: {}", reason);
+            }
+        };
+
+        if post_balance == 0 {
+            self.positions.close_position(mint, &signature)?;
+        } else {
+            self.positions.reduce_position(mint, actual_sell_pct, &signature)?;
+        }
+
+        // Record trade
+        let trade = Trade {
+            id: Uuid::new_v4().to_string(),
+            token_mint: mint.to_string(),
+            token_symbol: mint.to_string(),
+            trade_type: TradeType::Sell,
+            amount_sol: expected_sol_out as f64 / 1_000_000_000.0,
+            amount_tokens: pre_balance.saturating_sub(post_balance) as f64,
+            price_per_token: 0.0,
+            slippage_bps: self.config.default_slippage_bps,
+            tx_signature: Some(signature.clone()),
+            status: TradeStatus::Confirmed,
+            wallet_pubkey: wallet.pubkey().to_string(),
+            created_at: Utc::now(),
+            confirmed_at: Some(Utc::now()),
+            pnl_sol: None,
+            security_score: None,
+        };
+        if let Err(e) = db::queries::insert_trade(&self.db, &trade) {
+            warn!(error = %e, "Failed to record RaydiumDirect sell trade");
         }
 
         Ok(signature)

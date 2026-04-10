@@ -165,6 +165,9 @@ pub struct Config {
 
     // Network
     pub use_devnet: bool,
+
+    // Sprint 3b feature flag — direct Raydium CPMM swap (default OFF for safety)
+    pub enable_raydium_direct: bool,
 }
 
 impl Config {
@@ -274,6 +277,11 @@ impl Config {
                 .unwrap_or_else(|_| "false".to_string())
                 .parse()
                 .context("Invalid USE_DEVNET")?,
+
+            enable_raydium_direct: env::var("ENABLE_RAYDIUM_DIRECT")
+                .unwrap_or_else(|_| "false".to_string())
+                .parse()
+                .context("Invalid ENABLE_RAYDIUM_DIRECT")?,
         })
     }
 

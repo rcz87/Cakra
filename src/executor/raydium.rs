@@ -1,24 +1,36 @@
-// Raydium pool reader (Sprint 3a — read-only).
+// Raydium pool reader + direct swap builder.
 //
-// This module decodes Raydium pool state accounts and computes prices
-// from on-chain reserve balances. It does NOT yet build swap instructions —
-// that's reserved for Sprint 3b.
+// Sprint 3a (read-only): pool meta decoder + price reader for CPMM
+// Sprint 3b (offensive): direct swap_base_input instruction builder for CPMM
 //
-// Currently implemented:
-//   - CPMM (Constant Product Market Maker) — used by PumpSwap migrations
+// IMPORTANT — Sprint 3b safety:
+//   The CPMM swap builder is GATED behind ENABLE_RAYDIUM_DIRECT env var.
+//   Default OFF. Test manually with small position before enabling for real.
 //
-// Deferred to Sprint 3b:
-//   - AMM v4 layout (legacy, less common for newborns)
-//   - Direct buy/sell instruction builders
+// Layout sources:
+//   - Pool state offsets verified against Raydium CPMM source code
+//   - Discriminators computed from sha256("global:swap_base_input")[..8]
+//   - Authority PDA seed b"vault_and_lp_mint_auth_seed"
 
 use anyhow::{Context, Result};
 use solana_client::rpc_client::RpcClient;
+use solana_sdk::instruction::{AccountMeta, Instruction};
 use solana_sdk::pubkey::Pubkey;
 use std::str::FromStr;
 use tracing::{debug, warn};
 
 /// WSOL mint.
 const WSOL_MINT: &str = "So11111111111111111111111111111111111111112";
+
+/// Raydium CPMM program ID.
+pub const CPMM_PROGRAM_ID: &str = "CPMMoo8L3F4NbTegBCKVNunggL7H1ZpdTHKxQB5qKP1C";
+
+/// Authority PDA seed used by Raydium CPMM for vault & LP mint authority.
+const CPMM_AUTHORITY_SEED: &[u8] = b"vault_and_lp_mint_auth_seed";
+
+/// Anchor discriminator for `swap_base_input` instruction.
+/// sha256("global:swap_base_input")[..8] = [143, 190, 90, 218, 196, 30, 51, 222]
+const SWAP_BASE_INPUT_DISCRIMINATOR: [u8; 8] = [143, 190, 90, 218, 196, 30, 51, 222];
 
 /// Raydium CPMM Anchor pool state layout (well-known offsets):
 ///
@@ -36,10 +48,14 @@ const WSOL_MINT: &str = "So11111111111111111111111111111111111111112";
 /// 296..304 observation_key: Pubkey (start)
 /// ...
 /// ```
+const CPMM_AMM_CONFIG_OFFSET: usize = 8;
 const CPMM_TOKEN_0_VAULT_OFFSET: usize = 72;
 const CPMM_TOKEN_1_VAULT_OFFSET: usize = 104;
 const CPMM_TOKEN_0_MINT_OFFSET: usize = 168;
 const CPMM_TOKEN_1_MINT_OFFSET: usize = 200;
+const CPMM_TOKEN_0_PROGRAM_OFFSET: usize = 232;
+const CPMM_TOKEN_1_PROGRAM_OFFSET: usize = 264;
+const CPMM_OBSERVATION_KEY_OFFSET: usize = 296;
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum RaydiumPoolKind {
@@ -50,6 +66,8 @@ pub enum RaydiumPoolKind {
 }
 
 /// Decoded Raydium pool metadata: who's who in the vault layout.
+/// Sprint 3a populated only the basic fields (pool, kind, mints, vaults).
+/// Sprint 3b adds amm_config, observation_state, token programs for swap building.
 #[derive(Debug, Clone)]
 pub struct RaydiumPoolMeta {
     pub pool: Pubkey,
@@ -60,6 +78,13 @@ pub struct RaydiumPoolMeta {
     pub token_vault: Pubkey,
     /// The WSOL vault (holds wrapped SOL)
     pub sol_vault: Pubkey,
+    // ── Sprint 3b: extra context for swap instruction building ──
+    pub amm_config: Pubkey,
+    pub observation_state: Pubkey,
+    /// Token program for the project token (Token or Token-2022)
+    pub token_program: Pubkey,
+    /// Token program for WSOL (always classic Token)
+    pub sol_program: Pubkey,
 }
 
 /// Read pool state and decode into RaydiumPoolMeta.
@@ -84,7 +109,9 @@ pub fn load_pool_meta(rpc: &RpcClient, pool_address: &str) -> Result<RaydiumPool
         decode_cpmm_pool(&pool_pubkey, &account.data)
     } else if account.owner == amm_v4_program {
         // Sprint 3b will implement this. Return error so dispatcher falls back.
-        anyhow::bail!("AMM v4 pool reader not yet implemented (Sprint 3b)")
+        // AMM v4 layout differs from CPMM. Most newborns use CPMM so we
+        // deliberately defer this. Returns error → dispatcher falls back to Jupiter.
+        anyhow::bail!("AMM v4 pool reader not implemented — use Jupiter fallback")
     } else {
         anyhow::bail!(
             "Pool {} owned by unknown program {}",
@@ -95,38 +122,44 @@ pub fn load_pool_meta(rpc: &RpcClient, pool_address: &str) -> Result<RaydiumPool
 }
 
 fn decode_cpmm_pool(pool: &Pubkey, data: &[u8]) -> Result<RaydiumPoolMeta> {
-    if data.len() < CPMM_TOKEN_1_MINT_OFFSET + 32 {
+    if data.len() < CPMM_OBSERVATION_KEY_OFFSET + 32 {
         anyhow::bail!(
             "CPMM pool data too short: {} bytes (need at least {})",
             data.len(),
-            CPMM_TOKEN_1_MINT_OFFSET + 32
+            CPMM_OBSERVATION_KEY_OFFSET + 32
         );
     }
 
+    let amm_config = read_pubkey(data, CPMM_AMM_CONFIG_OFFSET)?;
     let token_0_vault = read_pubkey(data, CPMM_TOKEN_0_VAULT_OFFSET)?;
     let token_1_vault = read_pubkey(data, CPMM_TOKEN_1_VAULT_OFFSET)?;
     let token_0_mint = read_pubkey(data, CPMM_TOKEN_0_MINT_OFFSET)?;
     let token_1_mint = read_pubkey(data, CPMM_TOKEN_1_MINT_OFFSET)?;
+    let token_0_program = read_pubkey(data, CPMM_TOKEN_0_PROGRAM_OFFSET)?;
+    let token_1_program = read_pubkey(data, CPMM_TOKEN_1_PROGRAM_OFFSET)?;
+    let observation_state = read_pubkey(data, CPMM_OBSERVATION_KEY_OFFSET)?;
 
     let wsol: Pubkey = WSOL_MINT.parse().unwrap();
 
-    let (token_mint, token_vault, sol_vault) = if token_0_mint == wsol {
-        (token_1_mint, token_1_vault, token_0_vault)
-    } else if token_1_mint == wsol {
-        (token_0_mint, token_0_vault, token_1_vault)
-    } else {
-        // Neither side is SOL — non-WSOL pair, can't price in SOL
-        anyhow::bail!(
-            "CPMM pool {} has no WSOL side ({} / {})",
-            pool, token_0_mint, token_1_mint
-        );
-    };
+    let (token_mint, token_vault, sol_vault, token_program, sol_program) =
+        if token_0_mint == wsol {
+            (token_1_mint, token_1_vault, token_0_vault, token_1_program, token_0_program)
+        } else if token_1_mint == wsol {
+            (token_0_mint, token_0_vault, token_1_vault, token_0_program, token_1_program)
+        } else {
+            anyhow::bail!(
+                "CPMM pool {} has no WSOL side ({} / {})",
+                pool, token_0_mint, token_1_mint
+            );
+        };
 
     debug!(
         pool = %pool,
         token_mint = %token_mint,
         token_vault = %token_vault,
         sol_vault = %sol_vault,
+        amm_config = %amm_config,
+        observation = %observation_state,
         "Decoded CPMM pool meta"
     );
 
@@ -136,6 +169,10 @@ fn decode_cpmm_pool(pool: &Pubkey, data: &[u8]) -> Result<RaydiumPoolMeta> {
         token_mint,
         token_vault,
         sol_vault,
+        amm_config,
+        observation_state,
+        token_program,
+        sol_program,
     })
 }
 
@@ -223,6 +260,232 @@ pub fn quote_sell_exact_in(token_in: u64, sol_reserves: u64, token_reserves: u64
 #[allow(dead_code)]
 pub fn warn_unsupported(pool: &str) {
     warn!(pool = %pool, "Raydium pool kind not supported by reader yet");
+}
+
+// ════════════════════════════════════════════════════════════════
+// SPRINT 3b — DIRECT CPMM SWAP BUILDER (gated by ENABLE_RAYDIUM_DIRECT)
+// ════════════════════════════════════════════════════════════════
+
+/// Derive the global authority PDA for Raydium CPMM.
+/// This authority owns all vaults across all CPMM pools.
+pub fn derive_cpmm_authority() -> Result<(Pubkey, u8)> {
+    let program_id: Pubkey = CPMM_PROGRAM_ID.parse().context("Invalid CPMM program ID")?;
+    Ok(Pubkey::find_program_address(&[CPMM_AUTHORITY_SEED], &program_id))
+}
+
+/// Build a Raydium CPMM `swap_base_input` instruction.
+///
+/// Account order (CRITICAL — must match Raydium CPMM ABI):
+///   0  payer            signer mut
+///   1  authority        readonly  (global PDA)
+///   2  amm_config       readonly
+///   3  pool_state       mut
+///   4  input_account    mut       (user's WSOL ATA for buy / token ATA for sell)
+///   5  output_account   mut       (user's token ATA for buy / WSOL ATA for sell)
+///   6  input_vault      mut       (pool's vault for input side)
+///   7  output_vault     mut       (pool's vault for output side)
+///   8  input_token_program  readonly
+///   9  output_token_program readonly
+///   10 input_mint       readonly
+///   11 output_mint      readonly
+///   12 observation_state mut
+///
+/// Args (after 8-byte discriminator):
+///   amount_in: u64 LE
+///   minimum_amount_out: u64 LE
+pub fn build_cpmm_swap_ix(
+    meta: &RaydiumPoolMeta,
+    payer: &Pubkey,
+    user_input_ata: &Pubkey,
+    user_output_ata: &Pubkey,
+    is_buy: bool,
+    amount_in: u64,
+    minimum_amount_out: u64,
+) -> Result<Instruction> {
+    let program_id: Pubkey = CPMM_PROGRAM_ID.parse().context("Invalid CPMM program ID")?;
+    let (authority, _bump) = derive_cpmm_authority()?;
+
+    // For BUY: input = WSOL, output = token
+    // For SELL: input = token, output = WSOL
+    let (
+        input_vault,
+        output_vault,
+        input_token_program,
+        output_token_program,
+        input_mint,
+        output_mint,
+    ) = if is_buy {
+        (
+            meta.sol_vault,
+            meta.token_vault,
+            meta.sol_program,
+            meta.token_program,
+            // WSOL mint
+            WSOL_MINT.parse::<Pubkey>().unwrap(),
+            meta.token_mint,
+        )
+    } else {
+        (
+            meta.token_vault,
+            meta.sol_vault,
+            meta.token_program,
+            meta.sol_program,
+            meta.token_mint,
+            WSOL_MINT.parse::<Pubkey>().unwrap(),
+        )
+    };
+
+    let accounts = vec![
+        AccountMeta::new(*payer, true),                       // 0  signer mut
+        AccountMeta::new_readonly(authority, false),          // 1  readonly
+        AccountMeta::new_readonly(meta.amm_config, false),    // 2  readonly
+        AccountMeta::new(meta.pool, false),                   // 3  mut
+        AccountMeta::new(*user_input_ata, false),             // 4  mut
+        AccountMeta::new(*user_output_ata, false),            // 5  mut
+        AccountMeta::new(input_vault, false),                 // 6  mut
+        AccountMeta::new(output_vault, false),                // 7  mut
+        AccountMeta::new_readonly(input_token_program, false),// 8  readonly
+        AccountMeta::new_readonly(output_token_program, false),// 9 readonly
+        AccountMeta::new_readonly(input_mint, false),         // 10 readonly
+        AccountMeta::new_readonly(output_mint, false),        // 11 readonly
+        AccountMeta::new(meta.observation_state, false),      // 12 mut
+    ];
+
+    // Build instruction data: discriminator + amount_in + min_amount_out
+    let mut data = Vec::with_capacity(8 + 8 + 8);
+    data.extend_from_slice(&SWAP_BASE_INPUT_DISCRIMINATOR);
+    data.extend_from_slice(&amount_in.to_le_bytes());
+    data.extend_from_slice(&minimum_amount_out.to_le_bytes());
+
+    Ok(Instruction {
+        program_id,
+        accounts,
+        data,
+    })
+}
+
+/// Build a complete Raydium CPMM buy instruction sequence:
+///   1. Create user's token ATA (idempotent)
+///   2. Create user's WSOL ATA (idempotent)
+///   3. Transfer SOL → WSOL ATA
+///   4. sync_native to reflect lamport balance as WSOL
+///   5. swap_base_input (WSOL → token)
+///   6. Close WSOL ATA → unwrap any leftover SOL
+pub fn build_raydium_buy_instructions(
+    meta: &RaydiumPoolMeta,
+    payer: &Pubkey,
+    amount_sol_lamports: u64,
+    minimum_token_out: u64,
+) -> Result<Vec<Instruction>> {
+    use solana_sdk::system_instruction;
+
+    let wsol_mint: Pubkey = WSOL_MINT.parse().unwrap();
+    let token_program: Pubkey = "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA".parse().unwrap();
+
+    // Derive user ATAs
+    let user_wsol_ata = spl_associated_token_account::get_associated_token_address(payer, &wsol_mint);
+    let user_token_ata =
+        spl_associated_token_account::get_associated_token_address_with_program_id(
+            payer, &meta.token_mint, &meta.token_program,
+        );
+
+    let mut ixs = Vec::new();
+
+    // 1. Create user token ATA (use the right token program — handles Token-2022)
+    ixs.push(
+        spl_associated_token_account::instruction::create_associated_token_account_idempotent(
+            payer, payer, &meta.token_mint, &meta.token_program,
+        ),
+    );
+
+    // 2. Create user WSOL ATA (always classic Token program)
+    ixs.push(
+        spl_associated_token_account::instruction::create_associated_token_account_idempotent(
+            payer, payer, &wsol_mint, &token_program,
+        ),
+    );
+
+    // 3. Transfer SOL → WSOL ATA
+    ixs.push(system_instruction::transfer(payer, &user_wsol_ata, amount_sol_lamports));
+
+    // 4. sync_native — instruction discriminator 17 in spl-token (single byte)
+    ixs.push(spl_token::instruction::sync_native(
+        &token_program,
+        &user_wsol_ata,
+    ).context("Failed to build sync_native")?);
+
+    // 5. The actual swap
+    ixs.push(build_cpmm_swap_ix(
+        meta,
+        payer,
+        &user_wsol_ata,
+        &user_token_ata,
+        true, // is_buy
+        amount_sol_lamports,
+        minimum_token_out,
+    )?);
+
+    // 6. Close WSOL ATA — unwrap any leftover SOL back to wallet
+    ixs.push(spl_token::instruction::close_account(
+        &token_program,
+        &user_wsol_ata,
+        payer,
+        payer,
+        &[],
+    ).context("Failed to build close_account for WSOL")?);
+
+    Ok(ixs)
+}
+
+/// Build a complete Raydium CPMM sell instruction sequence:
+///   1. Create user's WSOL ATA (idempotent — receives output)
+///   2. swap_base_input (token → WSOL)
+///   3. Close WSOL ATA → unwrap to SOL
+pub fn build_raydium_sell_instructions(
+    meta: &RaydiumPoolMeta,
+    payer: &Pubkey,
+    token_amount: u64,
+    minimum_sol_out_lamports: u64,
+) -> Result<Vec<Instruction>> {
+    let wsol_mint: Pubkey = WSOL_MINT.parse().unwrap();
+    let token_program: Pubkey = "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA".parse().unwrap();
+
+    let user_wsol_ata = spl_associated_token_account::get_associated_token_address(payer, &wsol_mint);
+    let user_token_ata =
+        spl_associated_token_account::get_associated_token_address_with_program_id(
+            payer, &meta.token_mint, &meta.token_program,
+        );
+
+    let mut ixs = Vec::new();
+
+    // 1. Ensure WSOL ATA exists (output destination)
+    ixs.push(
+        spl_associated_token_account::instruction::create_associated_token_account_idempotent(
+            payer, payer, &wsol_mint, &token_program,
+        ),
+    );
+
+    // 2. Swap token → WSOL
+    ixs.push(build_cpmm_swap_ix(
+        meta,
+        payer,
+        &user_token_ata,
+        &user_wsol_ata,
+        false, // is_buy = false
+        token_amount,
+        minimum_sol_out_lamports,
+    )?);
+
+    // 3. Unwrap WSOL → SOL (close ATA, returns lamports to payer)
+    ixs.push(spl_token::instruction::close_account(
+        &token_program,
+        &user_wsol_ata,
+        payer,
+        payer,
+        &[],
+    ).context("Failed to build close_account for WSOL")?);
+
+    Ok(ixs)
 }
 
 #[cfg(test)]

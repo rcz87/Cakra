@@ -1,8 +1,13 @@
 use std::collections::HashMap;
+use std::str::FromStr;
 use std::sync::{Arc, RwLock};
 
 use anyhow::{Context, Result};
 use chrono::Utc;
+use solana_client::rpc_client::RpcClient;
+use solana_sdk::program_pack::Pack;
+use solana_sdk::pubkey::Pubkey;
+use spl_token::state::Mint;
 use tracing::{info, warn};
 use uuid::Uuid;
 
@@ -52,6 +57,10 @@ impl PositionManager {
         _slippage_bps: u16,
         buy_tx: &str,
         security_score: u8,
+        token_source: &str,
+        pool_address: Option<String>,
+        token_decimals: u8,
+        price_source: Option<String>,
     ) -> Result<Position> {
         let position = Position {
             id: Uuid::new_v4().to_string(),
@@ -69,6 +78,12 @@ impl PositionManager {
             pnl_sol: 0.0,
             pnl_pct: 0.0,
             status: PositionStatus::Open,
+            token_source: token_source.to_string(),
+            pool_address,
+            token_decimals,
+            price_source,
+            price_stale: false,
+            last_price_at: None,
             buy_tx: buy_tx.to_string(),
             sell_tx: None,
             opened_at: Utc::now(),
@@ -295,6 +310,86 @@ impl PositionManager {
         Ok(())
     }
 
+    /// Backfill `token_decimals` for any open positions where it's still the default.
+    /// Reads decimals from the on-chain mint account. Falls back to 6 with warning.
+    /// Should be called after `load_from_db` on startup.
+    pub fn backfill_decimals(&self, rpc: &RpcClient) -> Result<()> {
+        let positions: Vec<Position> = {
+            let map = self
+                .positions
+                .read()
+                .map_err(|e| anyhow::anyhow!("Position lock poisoned: {e}"))?;
+            map.values().cloned().collect()
+        };
+
+        let mut updated = 0;
+        for pos in positions {
+            // Only backfill open positions; closed ones don't matter
+            if !matches!(pos.status, PositionStatus::Open) {
+                continue;
+            }
+
+            let pk = match Pubkey::from_str(&pos.token_mint) {
+                Ok(p) => p,
+                Err(e) => {
+                    warn!(mint = %pos.token_mint, error = %e, "Backfill: invalid mint pubkey");
+                    continue;
+                }
+            };
+
+            let decimals = match rpc.get_account(&pk) {
+                Ok(account) => match Mint::unpack(&account.data) {
+                    Ok(mint_state) => mint_state.decimals,
+                    Err(_) => {
+                        // Token-2022: decimals is at offset 44
+                        if account.data.len() >= 45 {
+                            account.data[44]
+                        } else {
+                            warn!(mint = %pos.token_mint, "Backfill: cannot decode decimals, using 6");
+                            6
+                        }
+                    }
+                },
+                Err(e) => {
+                    warn!(
+                        mint = %pos.token_mint,
+                        error = %e,
+                        "Backfill: failed to fetch mint account, keeping current decimals"
+                    );
+                    continue;
+                }
+            };
+
+            if decimals == pos.token_decimals {
+                continue;  // already correct
+            }
+
+            // Update in-memory and persist
+            {
+                let mut map = self
+                    .positions
+                    .write()
+                    .map_err(|e| anyhow::anyhow!("Position lock poisoned: {e}"))?;
+                if let Some(p) = map.get_mut(&pos.token_mint) {
+                    p.token_decimals = decimals;
+                    let p_clone = p.clone();
+                    drop(map);
+                    self.persist_position(&p_clone)?;
+                    updated += 1;
+                    info!(
+                        mint = %pos.token_mint,
+                        old = pos.token_decimals,
+                        new = decimals,
+                        "Backfilled token_decimals"
+                    );
+                }
+            }
+        }
+
+        info!(updated, "Decimals backfill complete");
+        Ok(())
+    }
+
     /// Load positions from the database into memory.
     pub fn load_from_db(&self) -> Result<()> {
         let conn = self
@@ -307,7 +402,8 @@ impl PositionManager {
                 "SELECT id, token_mint, token_symbol, wallet_pubkey, entry_price_sol, \
                  entry_amount_sol, token_amount, current_price_sol, highest_price_sol, \
                  take_profit_pct, stop_loss_pct, trailing_stop_pct, pnl_sol, pnl_pct, \
-                 status, buy_tx, sell_tx, opened_at, closed_at, security_score \
+                 status, buy_tx, sell_tx, opened_at, closed_at, security_score, \
+                 token_source, pool_address, token_decimals, price_source, price_stale, last_price_at \
                  FROM positions WHERE status = 'Open'",
             )
             .context("Failed to prepare positions query")?;
@@ -349,6 +445,18 @@ impl PositionManager {
                         .map(|dt| dt.with_timezone(&Utc)),
                     security_score: row.get::<_, u32>(19).unwrap_or(0) as u8,
                     age_secs: 0,
+                    token_source: row.get::<_, Option<String>>(20)
+                        .ok().flatten().unwrap_or_else(|| "Unknown".to_string()),
+                    pool_address: row.get::<_, Option<String>>(21).ok().flatten(),
+                    token_decimals: row.get::<_, Option<u32>>(22)
+                        .ok().flatten().unwrap_or(6) as u8,
+                    price_source: row.get::<_, Option<String>>(23).ok().flatten(),
+                    price_stale: row.get::<_, Option<i32>>(24)
+                        .ok().flatten().unwrap_or(0) != 0,
+                    last_price_at: row.get::<_, Option<String>>(25)
+                        .ok().flatten()
+                        .and_then(|s| chrono::DateTime::parse_from_rfc3339(&s).ok())
+                        .map(|dt| dt.with_timezone(&Utc)),
                 })
             })
             .context("Failed to query positions")?;
@@ -390,8 +498,9 @@ impl PositionManager {
              (id, token_mint, token_symbol, wallet_pubkey, entry_price_sol, \
               entry_amount_sol, token_amount, current_price_sol, highest_price_sol, \
               take_profit_pct, stop_loss_pct, trailing_stop_pct, pnl_sol, pnl_pct, \
-              status, buy_tx, sell_tx, opened_at, closed_at, security_score) \
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20)",
+              status, buy_tx, sell_tx, opened_at, closed_at, security_score, \
+              token_source, pool_address, token_decimals, price_source, price_stale, last_price_at) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26)",
             rusqlite::params![
                 position.id,
                 position.token_mint,
@@ -413,6 +522,12 @@ impl PositionManager {
                 position.opened_at.to_rfc3339(),
                 position.closed_at.map(|t| t.to_rfc3339()),
                 position.security_score as u32,
+                position.token_source,
+                position.pool_address,
+                position.token_decimals as u32,
+                position.price_source,
+                position.price_stale as i32,
+                position.last_price_at.map(|t| t.to_rfc3339()),
             ],
         )
         .context("Failed to persist position")?;

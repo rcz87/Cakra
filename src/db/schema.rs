@@ -1,5 +1,6 @@
 use anyhow::Result;
 use rusqlite::Connection;
+use tracing::{info, warn};
 
 pub fn create_tables(conn: &Connection) -> Result<()> {
     conn.execute_batch(
@@ -109,5 +110,47 @@ pub fn create_tables(conn: &Connection) -> Result<()> {
         CREATE INDEX IF NOT EXISTS idx_tokens_source ON tokens(source);
         ",
     )?;
+
+    // Run idempotent migrations (ALTER TABLE ADD COLUMN)
+    run_migrations(conn)?;
+
+    Ok(())
+}
+
+/// Run idempotent migrations. Each ALTER is wrapped in a try/catch
+/// because SQLite has no `IF NOT EXISTS` for ADD COLUMN — we detect
+/// "duplicate column name" errors and continue.
+fn run_migrations(conn: &Connection) -> Result<()> {
+    let migrations: &[(&str, &str)] = &[
+        // Migration 002: position metadata for source-aware execution
+        ("002_positions_token_source",
+         "ALTER TABLE positions ADD COLUMN token_source TEXT NOT NULL DEFAULT 'Unknown'"),
+        ("002_positions_pool_address",
+         "ALTER TABLE positions ADD COLUMN pool_address TEXT"),
+        ("002_positions_token_decimals",
+         "ALTER TABLE positions ADD COLUMN token_decimals INTEGER NOT NULL DEFAULT 6"),
+        ("002_positions_price_source",
+         "ALTER TABLE positions ADD COLUMN price_source TEXT"),
+        ("002_positions_price_stale",
+         "ALTER TABLE positions ADD COLUMN price_stale INTEGER NOT NULL DEFAULT 0"),
+        ("002_positions_last_price_at",
+         "ALTER TABLE positions ADD COLUMN last_price_at TEXT"),
+    ];
+
+    for (name, sql) in migrations {
+        match conn.execute(sql, []) {
+            Ok(_) => info!(migration = name, "Applied migration"),
+            Err(e) => {
+                let msg = e.to_string();
+                if msg.contains("duplicate column name") {
+                    // Already applied — this is the idempotent path
+                } else {
+                    warn!(migration = name, error = %msg, "Migration failed");
+                    return Err(e.into());
+                }
+            }
+        }
+    }
+
     Ok(())
 }

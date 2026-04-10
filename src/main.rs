@@ -101,6 +101,15 @@ async fn main() -> Result<()> {
         warn!(error = %e, "Failed to load positions from database");
     }
 
+    // Backfill token_decimals for legacy positions opened before metadata was tracked.
+    // Uses a temporary RPC client; failures fall back to default 6 decimals.
+    {
+        let backfill_rpc = solana_client::rpc_client::RpcClient::new(config.solana_rpc_url.clone());
+        if let Err(e) = position_manager.backfill_decimals(&backfill_rpc) {
+            warn!(error = %e, "Decimals backfill failed; positions may have wrong decimals");
+        }
+    }
+
     // ── Wallet Manager (shared for buy/sell) ─────────────────────
     let wallet_password = std::env::var("WALLET_PASSWORD")
         .expect("WALLET_PASSWORD must be set — cannot start without wallet encryption password");

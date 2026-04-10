@@ -205,7 +205,8 @@ pub fn get_open_positions(db: &DbPool) -> Result<Vec<Position>> {
         "SELECT id, token_mint, token_symbol, wallet_pubkey, entry_price_sol, \
          entry_amount_sol, token_amount, current_price_sol, highest_price_sol, \
          take_profit_pct, stop_loss_pct, trailing_stop_pct, pnl_sol, pnl_pct, \
-         status, buy_tx, sell_tx, opened_at, closed_at, security_score \
+         status, buy_tx, sell_tx, opened_at, closed_at, security_score, \
+         token_source, pool_address, token_decimals, price_source, price_stale, last_price_at \
          FROM positions WHERE status = 'Open' ORDER BY opened_at DESC"
     )?;
     let rows = stmt.query_map([], |row| {
@@ -213,6 +214,7 @@ pub fn get_open_positions(db: &DbPool) -> Result<Vec<Position>> {
         let status = parse_position_status(&status_str);
         let opened_str: String = row.get(17)?;
         let closed_str: Option<String> = row.get(18)?;
+        let last_price_str: Option<String> = row.get(25)?;
 
         Ok(Position {
             id: row.get(0)?,
@@ -240,6 +242,14 @@ pub fn get_open_positions(db: &DbPool) -> Result<Vec<Position>> {
                 .map(|dt| dt.with_timezone(&chrono::Utc)),
             security_score: row.get::<_, Option<u8>>(19)?.unwrap_or(0),
             age_secs: 0,
+            token_source: row.get(20)?,
+            pool_address: row.get(21)?,
+            token_decimals: row.get::<_, u32>(22)? as u8,
+            price_source: row.get(23)?,
+            price_stale: row.get::<_, i32>(24)? != 0,
+            last_price_at: last_price_str
+                .and_then(|s| chrono::DateTime::parse_from_rfc3339(&s).ok())
+                .map(|dt| dt.with_timezone(&chrono::Utc)),
         })
     })?;
     Ok(rows.filter_map(|r| r.ok()).collect())

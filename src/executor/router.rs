@@ -80,7 +80,7 @@ pub async fn find_best_route(
         "Finding best route"
     );
 
-    // For PumpFun tokens: always prefer PumpPortal Direct (fastest + MEV protected)
+    // For PumpFun tokens (still on bonding curve): use PumpPortal Direct.
     // PumpPortal handles tx building + Jito tip, we just sign and submit.
     if matches!(token.source, TokenSource::PumpFun) {
         info!(
@@ -109,6 +109,26 @@ pub async fn find_best_route(
             estimated_output = expected_output,
             "PumpPortal Direct route selected"
         );
+
+        return Ok(route);
+    }
+
+    // For PumpSwap (migrated PumpFun on AMM pool): use PumpPortal with pool="pump-amm".
+    // CRITICAL: PumpSwap is NOT bonding curve. Never fall back to get_pumpfun_quote
+    // for PumpSwap — that would use wrong math (bonding curve formula on AMM pool).
+    if matches!(token.source, TokenSource::PumpSwap) {
+        info!(
+            mint = %token.mint,
+            age_secs = token_age_secs,
+            "PumpSwap token (migrated AMM) → PumpPortal Direct (pool=pump-amm)"
+        );
+
+        let route = Route {
+            route_type: RouteType::PumpPortalDirect,
+            expected_output: 0,  // PumpPortal will price it
+            min_output: 0,
+            price_impact_pct: 0.0,
+        };
 
         return Ok(route);
     }
@@ -154,8 +174,10 @@ pub async fn find_best_route(
         }
     }
 
-    // 2. If Jupiter had no route and token is from PumpSwap (migrated PumpFun), try PumpPortal
-    if matches!(token.source, TokenSource::PumpFun | TokenSource::PumpSwap) && token_age_secs < PUMPFUN_FALLBACK_AGE_SECS {
+    // 2. PumpFun-only fallback: if Jupiter had no route AND token is still on bonding curve
+    //    (PumpFun source, not PumpSwap), try direct bonding curve buy.
+    //    PumpSwap is excluded — it's an AMM pool, not bonding curve. Wrong math.
+    if matches!(token.source, TokenSource::PumpFun) && token_age_secs < PUMPFUN_FALLBACK_AGE_SECS {
         info!(
             mint = %token.mint,
             age_secs = token_age_secs,

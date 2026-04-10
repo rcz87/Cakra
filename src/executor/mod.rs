@@ -204,10 +204,21 @@ impl ExecutorService {
                 wallet, &token.mint, expected_output
             ).await.unwrap_or(expected_output);
 
+            // CRITICAL: entry_price is per BASE UNIT to match PriceFeed.
+            // Previous bug: divided by 1_000_000 (whole token assumption) which made
+            // PnL calculations 10^6 off and triggered phantom -99% losses.
             let entry_price = if actual_output > 0 {
-                amount_sol / (actual_output as f64 / 1_000_000.0)
+                amount_sol / actual_output as f64
             } else {
                 0.0
+            };
+
+            // Source-aware metadata for price feed and exit routing
+            let token_source_str = format!("{:?}", token.source);
+            let price_source = match token.source {
+                crate::models::token::TokenSource::PumpFun => Some("PumpFunBondingCurve".to_string()),
+                crate::models::token::TokenSource::PumpSwap => Some("RaydiumPool".to_string()),
+                _ => Some("Jupiter".to_string()),
             };
 
             self.positions.open_position(
@@ -220,6 +231,10 @@ impl ExecutorService {
                 slippage_bps,
                 &signature,
                 0,
+                &token_source_str,
+                token.pool_address.clone(),
+                token.decimals,
+                price_source,
             )?;
 
             self.cooldown.record_trade(&taker);
@@ -499,10 +514,20 @@ impl ExecutorService {
             "Buy confirmed — balance verified on-chain"
         );
 
+        // entry_price per BASE UNIT (consistent with PriceFeed)
         let entry_price = if actual_output > 0 {
             amount_sol / (actual_output as f64)
         } else {
             0.0
+        };
+
+        // Source-aware metadata
+        let token_source_str = format!("{:?}", token.source);
+        let price_source = match token.source {
+            crate::models::token::TokenSource::PumpFun => Some("PumpFunBondingCurve".to_string()),
+            crate::models::token::TokenSource::PumpSwap => Some("RaydiumPool".to_string()),
+            crate::models::token::TokenSource::Raydium => Some("RaydiumPool".to_string()),
+            _ => Some("Jupiter".to_string()),
         };
 
         self.positions.open_position(
@@ -515,6 +540,10 @@ impl ExecutorService {
             self.config.default_slippage_bps,
             &signature,
             0, // security_score: caller can override when available
+            &token_source_str,
+            token.pool_address.clone(),
+            token.decimals,
+            price_source,
         )?;
 
         // Record trade in DB as Confirmed (bundle already landed)

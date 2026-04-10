@@ -16,8 +16,11 @@ pub struct Position {
     pub token_mint: String,
     pub token_symbol: String,
     pub wallet_pubkey: String,
+    /// SOL per single base unit (lamports per atomic token unit).
+    /// IMPORTANT: this MUST be consistent with PriceFeed which also uses per-base-unit.
     pub entry_price_sol: f64,
     pub entry_amount_sol: f64,
+    /// Token amount in BASE UNITS (not whole tokens).
     pub token_amount: f64,
     pub current_price_sol: f64,
     pub highest_price_sol: f64,
@@ -33,6 +36,19 @@ pub struct Position {
     pub closed_at: Option<DateTime<Utc>>,
     pub security_score: u8,
     pub age_secs: u64,
+    // ── Sprint 1: source-aware metadata ──
+    /// Token source: "PumpFun", "PumpSwap", "Raydium", "Unknown"
+    pub token_source: String,
+    /// Pool address (bonding curve for PumpFun, AMM pool for others)
+    pub pool_address: Option<String>,
+    /// Token decimals (6 for PumpFun by default, fetched from mint for others)
+    pub token_decimals: u8,
+    /// Where price feed should fetch prices: "Jupiter", "PumpFunBondingCurve", "RaydiumPool"
+    pub price_source: Option<String>,
+    /// Set true when price feed cannot fetch fresh price
+    pub price_stale: bool,
+    /// Last successful price update timestamp (RFC3339)
+    pub last_price_at: Option<DateTime<Utc>>,
 }
 
 impl Position {

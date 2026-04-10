@@ -184,6 +184,54 @@ impl ExecutorService {
 
         let expected_output = route.expected_output;
 
+        // ── OBSERVE-ONLY MODE ───────────────────────────────────────
+        // If observe_only flag is on, log the would-be trade with full metadata
+        // and return without spending SOL. Used to validate strategy hypothesis.
+        if self.config.observe_only {
+            let spot_price = if expected_output > 0 {
+                amount_sol / (expected_output as f64)
+            } else {
+                0.0
+            };
+            let observation = db::queries::Observation {
+                id: Uuid::new_v4().to_string(),
+                mint: token.mint.clone(),
+                symbol: token.symbol.clone(),
+                source: format!("{:?}", token.source),
+                security_score: 0, // not available here, see main.rs combined_score
+                opportunity_score: 0,
+                combined_score: 0,
+                route_type: format!("{:?}", route.route_type),
+                expected_output,
+                market_cap_sol: token.market_cap_sol,
+                liquidity_sol: token.initial_liquidity_sol,
+                spot_price_sol: spot_price,
+                wallet_sol_at_observation: wallet_sol_at_open,
+            };
+
+            info!(
+                mint = %token.mint,
+                symbol = %token.symbol,
+                source = ?token.source,
+                amount_sol,
+                expected_output,
+                spot_price,
+                liquidity_sol = token.initial_liquidity_sol,
+                market_cap_sol = token.market_cap_sol,
+                "OBSERVE-ONLY: would have bought (skipping submission)"
+            );
+
+            if let Err(e) = db::queries::insert_observation(&self.db, &observation) {
+                warn!(error = %e, "Failed to record observation");
+            }
+
+            // Record cooldown so observe-only doesn't flood with same-second logs
+            self.cooldown.record_trade(&taker);
+
+            // Return synthetic signature so caller treats this as success
+            return Ok(format!("observe-only-{}", observation.id));
+        }
+
         // 2. Build and execute based on route type
         //
         // PumpPortalDirect: PumpPortal builds the entire tx, we sign and Jito-submit.

@@ -92,6 +92,32 @@ pub fn create_tables(conn: &Connection) -> Result<()> {
             notify_pnl INTEGER NOT NULL DEFAULT 1
         );
 
+        CREATE TABLE IF NOT EXISTS observations (
+            id TEXT PRIMARY KEY,
+            mint TEXT NOT NULL,
+            symbol TEXT,
+            source TEXT NOT NULL,
+            security_score INTEGER,
+            opportunity_score INTEGER,
+            combined_score INTEGER,
+            route_type TEXT,
+            expected_output INTEGER,
+            market_cap_sol REAL,
+            liquidity_sol REAL,
+            spot_price_sol REAL,
+            wallet_sol_at_observation REAL,
+            observed_at TEXT NOT NULL,
+            -- post-hoc analysis fields (filled later by validator script)
+            price_after_60s_sol REAL,
+            price_after_300s_sol REAL,
+            hypothetical_pnl_60s REAL,
+            hypothetical_pnl_300s REAL,
+            analyzed_at TEXT
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_observations_mint ON observations(mint);
+        CREATE INDEX IF NOT EXISTS idx_observations_observed_at ON observations(observed_at);
+
         CREATE TABLE IF NOT EXISTS blacklist (
             mint TEXT PRIMARY KEY,
             reason TEXT,

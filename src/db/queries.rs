@@ -327,6 +327,53 @@ pub fn save_settings(db: &DbPool, s: &UserSettings) -> Result<()> {
     Ok(())
 }
 
+// ── Observation Queries (observe-only mode) ──
+
+#[derive(Debug, Clone)]
+pub struct Observation {
+    pub id: String,
+    pub mint: String,
+    pub symbol: String,
+    pub source: String,
+    pub security_score: u8,
+    pub opportunity_score: u8,
+    pub combined_score: u8,
+    pub route_type: String,
+    pub expected_output: u64,
+    pub market_cap_sol: f64,
+    pub liquidity_sol: f64,
+    pub spot_price_sol: f64,
+    pub wallet_sol_at_observation: f64,
+}
+
+pub fn insert_observation(db: &DbPool, obs: &Observation) -> Result<()> {
+    let conn = db.lock().unwrap();
+    conn.execute(
+        "INSERT INTO observations \
+         (id, mint, symbol, source, security_score, opportunity_score, combined_score, \
+          route_type, expected_output, market_cap_sol, liquidity_sol, spot_price_sol, \
+          wallet_sol_at_observation, observed_at) \
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)",
+        params![
+            obs.id,
+            obs.mint,
+            obs.symbol,
+            obs.source,
+            obs.security_score as i64,
+            obs.opportunity_score as i64,
+            obs.combined_score as i64,
+            obs.route_type,
+            obs.expected_output as i64,
+            obs.market_cap_sol,
+            obs.liquidity_sol,
+            obs.spot_price_sol,
+            obs.wallet_sol_at_observation,
+            chrono::Utc::now().to_rfc3339(),
+        ],
+    )?;
+    Ok(())
+}
+
 // ── Stats Queries ──
 
 #[derive(Debug, Clone, Default)]

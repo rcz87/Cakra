@@ -168,6 +168,10 @@ pub struct Config {
 
     // Sprint 3b feature flag — direct Raydium CPMM swap (default OFF for safety)
     pub enable_raydium_direct: bool,
+
+    // Observe-only mode — log "would have bought" but don't spend SOL
+    // Used to validate strategy hypothesis without risking capital
+    pub observe_only: bool,
 }
 
 impl Config {
@@ -282,6 +286,11 @@ impl Config {
                 .unwrap_or_else(|_| "false".to_string())
                 .parse()
                 .context("Invalid ENABLE_RAYDIUM_DIRECT")?,
+
+            observe_only: env::var("OBSERVE_ONLY")
+                .unwrap_or_else(|_| "false".to_string())
+                .parse()
+                .context("Invalid OBSERVE_ONLY")?,
         })
     }
 

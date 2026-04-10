@@ -14,6 +14,7 @@ use tracing::{debug, info, warn};
 
 use crate::executor::positions::PositionManager;
 use crate::executor::pumpfun_buy::derive_bonding_curve;
+use crate::executor::raydium::{load_pool_meta, pool_price_per_base_unit, read_reserves};
 use crate::models::Position;
 
 #[derive(Deserialize)]
@@ -241,14 +242,43 @@ impl PriceFeed {
         })
     }
 
-    /// Read a Raydium pool's vault reserves and compute price.
-    /// Phase-1 implementation: best-effort. Returns error if pool layout unknown.
+    /// Read a Raydium pool's vault reserves and compute price (Sprint 3a).
+    /// Currently supports CPMM only. AMM v4 falls back to Jupiter.
     fn get_raydium_pool_price(&self, pos: &Position) -> Result<PriceUpdate> {
-        // Phase 1: we don't yet implement full pool decoding for AMM v4 / CPMM.
-        // Return error so the dispatcher falls back to Jupiter.
-        // Sprint 3 will implement this properly with RaydiumPoolMeta + vault reads.
-        let _ = pos.pool_address.as_ref().context("No pool address stored")?;
-        anyhow::bail!("Raydium direct pool reader not yet implemented (Sprint 3)");
+        let pool_address = pos
+            .pool_address
+            .as_ref()
+            .context("Position has no pool_address — cannot read Raydium pool")?;
+
+        let meta = load_pool_meta(&self.rpc, pool_address)
+            .context("Failed to load Raydium pool metadata")?;
+
+        // Verify mint match (defensive — pool could have been mis-stored)
+        if meta.token_mint.to_string() != pos.token_mint {
+            anyhow::bail!(
+                "Pool token mint {} does not match position mint {}",
+                meta.token_mint, pos.token_mint
+            );
+        }
+
+        let (sol_reserves, token_reserves) = read_reserves(&self.rpc, &meta)?;
+        let price = pool_price_per_base_unit(sol_reserves, token_reserves)?;
+
+        debug!(
+            mint = %pos.token_mint,
+            pool = %meta.pool,
+            sol_reserves,
+            token_reserves,
+            price,
+            "Raydium pool price"
+        );
+
+        Ok(PriceUpdate {
+            mint: pos.token_mint.clone(),
+            price_sol: price,
+            source: PriceSource::RaydiumPool,
+            stale: false,
+        })
     }
 
     /// Jupiter price fetcher (existing logic, wrapped to return PriceUpdate).

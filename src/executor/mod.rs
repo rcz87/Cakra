@@ -673,11 +673,40 @@ impl ExecutorService {
             anyhow::bail!("Calculated sell amount is zero");
         }
 
+        // ── Source-aware sell routing (Sprint 3a) ──────────────
+        // Look up the position to learn its source. If we have an open position
+        // tagged as PumpFun/PumpSwap, prefer PumpPortal sell. Everything else
+        // (Raydium, Mature, Unknown) goes through Jupiter for now.
+        // Sprint 3b will add direct Raydium swap as Jupiter fallback for fresh pools.
+        let pos_source = self
+            .positions
+            .get_open_positions()
+            .into_iter()
+            .find(|p| p.token_mint == mint)
+            .map(|p| p.token_source);
+
+        let use_pumpportal = matches!(
+            pos_source.as_deref(),
+            Some("PumpFun") | Some("PumpSwap")
+        );
+
+        if use_pumpportal {
+            info!(
+                mint = %mint,
+                source = ?pos_source,
+                "Sell route: PumpPortal Direct (source-aware)"
+            );
+            return self.execute_sell_via_pumpportal(
+                mint, amount_pct, wallet, pos_source.as_deref().unwrap_or("PumpFun"),
+            ).await;
+        }
+
         info!(
             total_balance = total_amount,
             sell_pct = amount_pct,
             sell_amount = sell_amount,
-            "Selling via Jupiter Swap API"
+            source = ?pos_source,
+            "Sell route: Jupiter (source-aware)"
         );
 
         // 1. Get a quote: token → SOL
@@ -843,6 +872,114 @@ impl ExecutorService {
         };
         if let Err(e) = db::queries::insert_trade(&self.db, &trade) {
             warn!(error = %e, "Failed to record sell trade in DB");
+        }
+
+        Ok(signature)
+    }
+
+    /// Sell via PumpPortal Local Trade API (used for PumpFun bonding curve and PumpSwap AMM).
+    /// Avoids Jupiter dependency for tokens that may not be indexed yet.
+    async fn execute_sell_via_pumpportal(
+        &self,
+        mint: &str,
+        amount_pct: u8,
+        wallet: &Keypair,
+        token_source: &str,
+    ) -> Result<String> {
+        let pre_balance = self
+            .get_token_balance_for_mint(&wallet.pubkey(), mint)
+            .context("Failed to get token balance for PumpPortal sell")?;
+
+        if pre_balance == 0 {
+            anyhow::bail!("Token balance is zero for mint {mint}");
+        }
+
+        let pool = match token_source {
+            "PumpFun" => "pump",
+            "PumpSwap" => "pump-amm",
+            _ => "auto",
+        };
+
+        let jito_tip_sol = self.config.jito_tip_lamports as f64 / 1_000_000_000.0;
+        let signature = self
+            .pumpportal
+            .execute_sell(
+                mint,
+                amount_pct,
+                self.config.default_slippage_bps,
+                jito_tip_sol,
+                wallet,
+                pool,
+            )
+            .await
+            .context("PumpPortal sell execution failed")?;
+
+        info!(
+            mint = %mint,
+            signature = %signature,
+            pool = %pool,
+            "PumpPortal sell submitted"
+        );
+
+        // Verify outcome with the same path as Jupiter sell
+        let outcome = self
+            .verify_sell_outcome(mint, &signature, &wallet.pubkey(), pre_balance)
+            .await;
+
+        let (post_balance, _actual_sold, actual_sell_pct) = match outcome {
+            SellOutcome::BalanceReduced { post_balance, actual_sold, actual_sell_pct } => {
+                info!(
+                    mint = %mint,
+                    pre_balance,
+                    post_balance,
+                    actual_sold,
+                    "PumpPortal sell verified"
+                );
+                (post_balance, actual_sold, actual_sell_pct)
+            }
+            SellOutcome::SignatureConfirmed => {
+                warn!(
+                    mint = %mint,
+                    signature = %signature,
+                    "PumpPortal sell tx confirmed but balance check ambiguous, assuming full"
+                );
+                (0, pre_balance, 100)
+            }
+            SellOutcome::Failed(reason) => {
+                anyhow::bail!(
+                    "PumpPortal sell verification failed for {} (sig: {}): {}",
+                    mint, signature, reason
+                );
+            }
+        };
+
+        // Update position bookkeeping
+        if post_balance == 0 {
+            self.positions.close_position(mint, &signature)?;
+        } else {
+            self.positions.reduce_position(mint, actual_sell_pct, &signature)?;
+        }
+
+        // Record sell trade
+        let trade = Trade {
+            id: Uuid::new_v4().to_string(),
+            token_mint: mint.to_string(),
+            token_symbol: mint.to_string(),
+            trade_type: TradeType::Sell,
+            amount_sol: 0.0, // PumpPortal doesn't return SOL out in advance
+            amount_tokens: pre_balance.saturating_sub(post_balance) as f64,
+            price_per_token: 0.0,
+            slippage_bps: self.config.default_slippage_bps,
+            tx_signature: Some(signature.clone()),
+            status: TradeStatus::Confirmed,
+            wallet_pubkey: wallet.pubkey().to_string(),
+            created_at: Utc::now(),
+            confirmed_at: Some(Utc::now()),
+            pnl_sol: None,
+            security_score: None,
+        };
+        if let Err(e) = db::queries::insert_trade(&self.db, &trade) {
+            warn!(error = %e, "Failed to record PumpPortal sell trade");
         }
 
         Ok(signature)

@@ -10,6 +10,7 @@ use crate::config::{Config, TradingMode, TradingProfile};
 use crate::models::Position;
 
 use super::positions::PositionManager;
+use super::price_feed::PriceUpdate;
 
 /// Graduated TP/SL tier for partial exits.
 #[derive(Debug, Clone)]
@@ -162,8 +163,8 @@ impl TpSlMonitor {
     ///
     /// # Arguments
     /// * `price_rx` - Channel receiver for real-time price updates.
-    ///   Each message is (mint, price_sol).
-    pub async fn run(self, mut price_rx: mpsc::Receiver<(String, f64)>) -> Result<()> {
+    ///   Each message is a PriceUpdate with source + stale flag.
+    pub async fn run(self, mut price_rx: mpsc::Receiver<PriceUpdate>) -> Result<()> {
         info!(
             interval_secs = self.check_interval.as_secs(),
             "TP/SL monitor started"
@@ -174,8 +175,8 @@ impl TpSlMonitor {
         loop {
             tokio::select! {
                 // Process incoming price updates
-                Some((mint, price)) = price_rx.recv() => {
-                    self.handle_price_update(&mint, price).await;
+                Some(update) = price_rx.recv() => {
+                    self.handle_price_update(update).await;
                 }
 
                 // Periodic full check of all positions
@@ -187,16 +188,26 @@ impl TpSlMonitor {
     }
 
     /// Handle a single price update for a specific token.
-    async fn handle_price_update(&self, mint: &str, price: f64) {
-        // Update the position with the new price
-        if let Err(e) = self.positions.update_price(mint, price) {
-            warn!(mint = %mint, error = %e, "Failed to update position price");
+    async fn handle_price_update(&self, update: PriceUpdate) {
+        // Update the position with the new price + stale flag
+        if let Err(e) = self.positions.update_price_with_stale(
+            &update.mint, update.price_sol, update.stale,
+        ) {
+            warn!(mint = %update.mint, error = %e, "Failed to update position price");
             return;
+        }
+
+        if update.stale {
+            warn!(
+                mint = %update.mint,
+                source = ?update.source,
+                "Price update arrived stale — TP/SL on safety net only"
+            );
         }
 
         // Check if this position should trigger TP/SL
         let positions = self.positions.get_open_positions();
-        if let Some(pos) = positions.iter().find(|p| p.token_mint == mint) {
+        if let Some(pos) = positions.iter().find(|p| p.token_mint == update.mint) {
             self.evaluate_position(pos).await;
         }
     }
@@ -224,7 +235,29 @@ impl TpSlMonitor {
 
     /// Evaluate a single position for TP/SL conditions.
     async fn evaluate_position(&self, pos: &Position) {
-        // Check stop-loss first (highest priority)
+        // ── Stale-price safety net ─────────────────────────────────
+        // If price is stale, we don't trust take-profit triggers (data may be ahead
+        // of reality). But stop-loss + time-stop must STILL fire — otherwise the bot
+        // goes blind during a dump and rides positions to zero.
+        //
+        // Policy:
+        //   stale + elapsed < 60s  → only SL + time-stop allowed (skip TP/trailing)
+        //   stale + elapsed >= 60s → SL + time-stop only, log warning loudly
+        //   not stale              → all triggers active (normal)
+        let is_stale = pos.price_stale;
+        let stale_secs = pos.last_price_at
+            .map(|t| (chrono::Utc::now() - t).num_seconds().max(0) as u64)
+            .unwrap_or(0);
+
+        if is_stale && stale_secs >= 60 {
+            warn!(
+                mint = %pos.token_mint,
+                stale_secs,
+                "Price stale > 60s — running SL safety net only"
+            );
+        }
+
+        // Check stop-loss first (highest priority — runs even when stale)
         if pos.should_stop_loss() {
             warn!(
                 mint = %pos.token_mint,
@@ -297,6 +330,13 @@ impl TpSlMonitor {
             if let Err(e) = self.command_tx.send(cmd).await {
                 error!("Failed to send max age exit command: {e}");
             }
+            return;
+        }
+
+        // ── TP / trailing only when price is FRESH ────────────
+        // Stale prices can't be trusted for profit-taking decisions.
+        // SL + time-stop above already ran as safety net.
+        if is_stale {
             return;
         }
 

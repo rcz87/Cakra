@@ -169,7 +169,8 @@ async fn main() -> Result<()> {
     let (sell_tx, mut sell_rx) = mpsc::channel::<(String, u8)>(64);
 
     // ── Channel: PriceFeed → TpSlMonitor ───────────────────────
-    let (price_tx, price_rx) = mpsc::channel::<(String, f64)>(256);
+    let (price_tx, price_rx) =
+        mpsc::channel::<crate::executor::price_feed::PriceUpdate>(256);
 
     // ── Spawn Detector Service ─────────────────────────────────
     let mut detector_shutdown = shutdown_tx.subscribe();

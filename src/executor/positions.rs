@@ -132,6 +132,29 @@ impl PositionManager {
         Ok(())
     }
 
+    /// Update price + stale flag + last_price_at timestamp.
+    /// If stale=true, current_price_sol is NOT overwritten (we keep last fresh price).
+    pub fn update_price_with_stale(&self, mint: &str, price: f64, stale: bool) -> Result<()> {
+        let mut positions = self
+            .positions
+            .write()
+            .map_err(|e| anyhow::anyhow!("Position lock poisoned: {e}"))?;
+
+        if let Some(pos) = positions.get_mut(mint) {
+            pos.price_stale = stale;
+            if !stale {
+                pos.update_pnl(price);
+                pos.last_price_at = Some(chrono::Utc::now());
+            }
+            // Don't bother persisting every price tick — too noisy. The in-memory
+            // state is canonical for TP/SL evaluation; DB syncs on close.
+        } else {
+            warn!(mint = %mint, "No open position found to update price");
+        }
+
+        Ok(())
+    }
+
     /// Close a position (mark as manually closed).
     pub fn close_position(&self, mint: &str, sell_tx: &str) -> Result<()> {
         let mut positions = self

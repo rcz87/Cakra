@@ -13,11 +13,42 @@ use tokio::time::{interval, Duration};
 use tracing::{debug, info, warn};
 
 use crate::executor::positions::PositionManager;
+use crate::executor::pumpfun_buy::derive_bonding_curve;
+use crate::models::Position;
 
 #[derive(Deserialize)]
 struct JupiterQuoteResponse {
     #[serde(rename = "outAmount")]
     out_amount: String,
+}
+
+/// Where the price was sourced from.
+#[derive(Debug, Clone, PartialEq)]
+pub enum PriceSource {
+    Jupiter,
+    PumpFunBondingCurve,
+    RaydiumPool,
+}
+
+impl PriceSource {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            PriceSource::Jupiter => "Jupiter",
+            PriceSource::PumpFunBondingCurve => "PumpFunBondingCurve",
+            PriceSource::RaydiumPool => "RaydiumPool",
+        }
+    }
+}
+
+/// A price update sent to TP/SL monitor.
+/// `stale = true` signals that price feed could not get fresh data —
+/// TP/SL should hold off aggressive triggers but still honor SL safety net.
+#[derive(Debug, Clone)]
+pub struct PriceUpdate {
+    pub mint: String,
+    pub price_sol: f64,
+    pub source: PriceSource,
+    pub stale: bool,
 }
 
 pub struct PriceFeed {
@@ -52,10 +83,7 @@ impl PriceFeed {
     }
 
     /// Fetch token decimals from on-chain mint account, using a local cache.
-    /// Falls back to 6 decimals for PumpFun tokens (Token-2022 mint accounts
-    /// can't be deserialized with spl_token::state::Mint::unpack).
     fn get_decimals(&self, mint: &str) -> Result<u8> {
-        // Check cache first
         if let Some(&d) = self.decimals_cache.lock().unwrap().get(mint) {
             return Ok(d);
         }
@@ -63,28 +91,20 @@ impl PriceFeed {
         let pubkey = Pubkey::from_str(mint).context("Invalid mint pubkey")?;
 
         let decimals = match self.rpc.get_account(&pubkey) {
-            Ok(account) => {
-                // Try standard SPL Token unpack first
-                match Mint::unpack(&account.data) {
-                    Ok(mint_state) => mint_state.decimals,
-                    Err(_) => {
-                        // Token-2022 or other program — try reading decimals from raw data.
-                        // SPL Token mint layout: decimals is at offset 44 (1 byte) for both
-                        // Token and Token-2022 programs.
-                        if account.data.len() >= 45 {
-                            let d = account.data[44];
-                            info!(mint = %mint, decimals = d, "Decimals from raw data (Token-2022)");
-                            d
-                        } else {
-                            // PumpFun tokens are always 6 decimals
-                            info!(mint = %mint, "Using default 6 decimals (unpack failed)");
-                            6
-                        }
+            Ok(account) => match Mint::unpack(&account.data) {
+                Ok(mint_state) => mint_state.decimals,
+                Err(_) => {
+                    if account.data.len() >= 45 {
+                        let d = account.data[44];
+                        info!(mint = %mint, decimals = d, "Decimals from raw data (Token-2022)");
+                        d
+                    } else {
+                        info!(mint = %mint, "Using default 6 decimals (unpack failed)");
+                        6
                     }
                 }
-            }
+            },
             Err(_) => {
-                // RPC error — default to 6 for PumpFun tokens
                 info!(mint = %mint, "Mint account fetch failed, using 6 decimals");
                 6
             }
@@ -95,18 +115,17 @@ impl PriceFeed {
             .unwrap()
             .insert(mint.to_string(), decimals);
 
-        info!(mint = %mint, decimals, "Cached token decimals");
         Ok(decimals)
     }
 
     pub async fn run(
         self,
         positions: PositionManager,
-        price_tx: mpsc::Sender<(String, f64)>,
+        price_tx: mpsc::Sender<PriceUpdate>,
     ) -> Result<()> {
         info!(
             poll_interval_secs = self.poll_interval.as_secs(),
-            "Starting price feed"
+            "Starting price feed (multi-source dispatcher)"
         );
 
         let mut ticker = interval(self.poll_interval);
@@ -123,51 +142,135 @@ impl PriceFeed {
             debug!(count = open_positions.len(), "Polling prices for open positions");
 
             for position in &open_positions {
-                let mint = &position.token_mint;
-
-                let probe_amount = match self.get_decimals(mint) {
-                    Ok(d) => 10u64.pow(d as u32),
-                    Err(e) => {
-                        warn!(
-                            mint = %mint,
-                            error = %e,
-                            "Failed to fetch token decimals, skipping price poll"
-                        );
-                        continue;
-                    }
-                };
-
-                match get_token_price(
-                    &self.http,
-                    &self.jupiter_api_url,
-                    &self.jupiter_api_key,
-                    mint,
-                    probe_amount,
-                )
-                .await
-                {
-                    Ok(price) => {
-                        debug!(
-                            mint = %mint,
-                            price = price,
-                            decimals = probe_amount.trailing_zeros(),
-                            "Got price for token"
-                        );
-                        if let Err(e) = price_tx.send((mint.clone(), price)).await {
-                            warn!(error = %e, "Failed to send price update, receiver dropped");
-                            return Ok(());
-                        }
-                    }
-                    Err(e) => {
-                        warn!(
-                            mint = %mint,
-                            error = %e,
-                            "Failed to get price for token, skipping"
-                        );
-                    }
+                let update = self.get_price_for_position(position).await;
+                if let Err(e) = price_tx.send(update).await {
+                    warn!(error = %e, "Failed to send price update, receiver dropped");
+                    return Ok(());
                 }
             }
         }
+    }
+
+    /// Source-aware price dispatcher. Returns a PriceUpdate (possibly stale).
+    async fn get_price_for_position(&self, pos: &Position) -> PriceUpdate {
+        let source_hint = pos.price_source.as_deref().unwrap_or("Jupiter");
+        let mint = pos.token_mint.clone();
+
+        // Try the preferred source first
+        let primary = match source_hint {
+            "PumpFunBondingCurve" => self.get_pumpfun_price(pos),
+            "RaydiumPool" => self.get_raydium_pool_price(pos),
+            _ => self.get_jupiter_price(pos).await,
+        };
+
+        if let Ok(update) = primary {
+            return update;
+        }
+
+        // Fallback chain: try Jupiter as last resort for any source
+        if source_hint != "Jupiter" {
+            if let Ok(update) = self.get_jupiter_price(pos).await {
+                debug!(mint = %mint, "Fallback to Jupiter succeeded");
+                return update;
+            }
+        }
+
+        // All sources failed → return stale update with last known price
+        warn!(
+            mint = %mint,
+            source = %source_hint,
+            "All price sources failed — returning stale"
+        );
+        PriceUpdate {
+            mint,
+            price_sol: pos.current_price_sol,
+            source: PriceSource::Jupiter,
+            stale: true,
+        }
+    }
+
+    /// Read PumpFun bonding curve account directly and compute price per base unit.
+    /// Layout: [discriminator(8) | virtual_token_reserves(u64) | virtual_sol_reserves(u64) | ...]
+    fn get_pumpfun_price(&self, pos: &Position) -> Result<PriceUpdate> {
+        let mint_pubkey = Pubkey::from_str(&pos.token_mint).context("Invalid mint pubkey")?;
+        let (bc_pda, _) = derive_bonding_curve(&mint_pubkey)?;
+
+        let account = self
+            .rpc
+            .get_account(&bc_pda)
+            .context("Failed to fetch bonding curve account")?;
+
+        if account.data.len() < 24 {
+            anyhow::bail!("Bonding curve account data too short ({})", account.data.len());
+        }
+
+        // Skip 8-byte discriminator, read 2x u64
+        let virtual_token_reserves = u64::from_le_bytes(
+            account.data[8..16]
+                .try_into()
+                .context("Failed to read vTokenReserves")?,
+        );
+        let virtual_sol_reserves = u64::from_le_bytes(
+            account.data[16..24]
+                .try_into()
+                .context("Failed to read vSolReserves")?,
+        );
+
+        if virtual_token_reserves == 0 || virtual_sol_reserves == 0 {
+            anyhow::bail!("Bonding curve has zero reserves (token migrated?)");
+        }
+
+        // Price per base unit (consistent with Jupiter probe approach):
+        //   sol_per_token_base_unit = (virtual_sol_reserves / 1e9) / virtual_token_reserves
+        let price_per_base_unit =
+            (virtual_sol_reserves as f64 / 1_000_000_000.0) / virtual_token_reserves as f64;
+
+        debug!(
+            mint = %pos.token_mint,
+            v_sol = virtual_sol_reserves,
+            v_token = virtual_token_reserves,
+            price = price_per_base_unit,
+            "PumpFun bonding curve price"
+        );
+
+        Ok(PriceUpdate {
+            mint: pos.token_mint.clone(),
+            price_sol: price_per_base_unit,
+            source: PriceSource::PumpFunBondingCurve,
+            stale: false,
+        })
+    }
+
+    /// Read a Raydium pool's vault reserves and compute price.
+    /// Phase-1 implementation: best-effort. Returns error if pool layout unknown.
+    fn get_raydium_pool_price(&self, pos: &Position) -> Result<PriceUpdate> {
+        // Phase 1: we don't yet implement full pool decoding for AMM v4 / CPMM.
+        // Return error so the dispatcher falls back to Jupiter.
+        // Sprint 3 will implement this properly with RaydiumPoolMeta + vault reads.
+        let _ = pos.pool_address.as_ref().context("No pool address stored")?;
+        anyhow::bail!("Raydium direct pool reader not yet implemented (Sprint 3)");
+    }
+
+    /// Jupiter price fetcher (existing logic, wrapped to return PriceUpdate).
+    async fn get_jupiter_price(&self, pos: &Position) -> Result<PriceUpdate> {
+        let mint = &pos.token_mint;
+        let probe_amount = 10u64.pow(self.get_decimals(mint).unwrap_or(6) as u32);
+
+        let price = get_token_price(
+            &self.http,
+            &self.jupiter_api_url,
+            &self.jupiter_api_key,
+            mint,
+            probe_amount,
+        )
+        .await?;
+
+        Ok(PriceUpdate {
+            mint: mint.clone(),
+            price_sol: price,
+            source: PriceSource::Jupiter,
+            stale: false,
+        })
     }
 }
 
@@ -176,10 +279,6 @@ impl PriceFeed {
 /// Sells `probe_amount` base units of the token (= 1 whole token, i.e.
 /// `10^decimals`) for SOL and derives the price **per single base unit**.
 /// This matches `entry_price_sol` in positions (= `amount_sol / output_base_units`).
-///
-/// Math:
-///   out_lamports = Jupiter outAmount (lamports of SOL received)
-///   price_per_base_unit = (out_lamports / 1e9) / probe_amount
 pub async fn get_token_price(
     http: &reqwest::Client,
     jupiter_url: &str,
@@ -210,8 +309,6 @@ pub async fn get_token_price(
         .parse()
         .map_err(|e| anyhow::anyhow!("Failed to parse outAmount '{}': {}", resp.out_amount, e))?;
 
-    // Convert lamports → SOL, then divide by probe amount to get price per
-    // single base unit.  Matches entry_price_sol = amount_sol / output_base_units.
     let price_per_token = (out_amount_lamports / 1_000_000_000.0) / probe_amount as f64;
 
     Ok(price_per_token)

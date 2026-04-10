@@ -130,20 +130,38 @@ pub async fn confirm_entry(
     }
 }
 
+/// Source-aware minimum liquidity (creator buy or pool depth) for snipe entry.
+///
+/// Different sources have different liquidity norms:
+/// - PumpFun bonding curve: creator buys 1-5 SOL is normal, mcap grows with traffic
+/// - PumpSwap: migrated AMM, expect a bit more depth
+/// - Raydium fresh pool: should have real depth from launch ($4k+ at minimum)
+///
+/// Forcing the Raydium standard onto PumpFun = "0 trades, 0 data" deadlock.
+fn min_liquidity_sol_for_source(source: &TokenSource) -> f64 {
+    match source {
+        TokenSource::PumpFun => 3.0,
+        TokenSource::PumpSwap => 5.0,
+        TokenSource::Raydium => 30.0,
+        TokenSource::Unknown => 30.0,
+    }
+}
+
 /// Fast entry confirmation for snipe mode — no Jupiter dependency.
 ///
 /// Checks:
-/// 1. Token has minimum liquidity (from detection data)
+/// 1. Token has minimum liquidity (source-aware)
 /// 2. Token source is supported (PumpFun, Raydium, PumpSwap)
 /// 3. Token is not too old (stale snipe = bad risk/reward)
 ///
 /// Does NOT call any external APIs — pure local data check.
 pub fn confirm_entry_fast(token: &TokenInfo) -> EntryDecision {
-    // Reject if liquidity too low — min 30 SOL (~$4k) for viable snipe
-    if token.initial_liquidity_sol < 30.0 {
+    // Source-aware liquidity gate (Sprint 4: framework Raydium tidak boleh dipaksa ke PumpFun)
+    let min_liq = min_liquidity_sol_for_source(&token.source);
+    if token.initial_liquidity_sol < min_liq {
         return EntryDecision::Reject(format!(
-            "Liquidity too low for snipe: {:.2} SOL (min 30.0)",
-            token.initial_liquidity_sol
+            "Liquidity too low for {}: {:.2} SOL (min {:.1})",
+            token.source, token.initial_liquidity_sol, min_liq
         ));
     }
 

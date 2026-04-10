@@ -324,3 +324,113 @@ pub fn save_settings(db: &DbPool, s: &UserSettings) -> Result<()> {
     )?;
     Ok(())
 }
+
+// ── Stats Queries ──
+
+#[derive(Debug, Clone, Default)]
+pub struct PerformanceStats {
+    // Position counts by status
+    pub total_positions: u32,
+    pub open: u32,
+    pub closed_tp: u32,
+    pub closed_sl: u32,
+    pub closed_manual: u32,
+    pub closed_error: u32,
+    // PnL aggregates (in SOL) — only from closed positions with non-null pnl_sol
+    pub total_pnl_sol: f64,
+    pub winners: u32,    // closed positions with pnl_sol > 0
+    pub losers: u32,     // closed positions with pnl_sol < 0
+    pub avg_win_sol: f64,
+    pub avg_loss_sol: f64,
+    pub best_win_sol: f64,
+    pub worst_loss_sol: f64,
+    // Source breakdown
+    pub by_source: Vec<(String, u32, f64)>,  // (source, count, sum_pnl)
+    // Recent activity
+    pub trades_24h: u32,
+}
+
+pub fn get_performance_stats(db: &DbPool) -> Result<PerformanceStats> {
+    let conn = db.lock().unwrap();
+    let mut stats = PerformanceStats::default();
+
+    // Counts by status
+    let mut stmt = conn.prepare(
+        "SELECT status, COUNT(*) FROM positions GROUP BY status"
+    )?;
+    let rows = stmt.query_map([], |row| {
+        Ok((row.get::<_, String>(0)?, row.get::<_, u32>(1)?))
+    })?;
+    for r in rows {
+        let (status, count) = r?;
+        stats.total_positions += count;
+        match status.as_str() {
+            "Open" => stats.open = count,
+            "ClosedTp" => stats.closed_tp = count,
+            "ClosedSl" => stats.closed_sl = count,
+            "ClosedManual" => stats.closed_manual = count,
+            "ClosedError" => stats.closed_error = count,
+            _ => {}
+        }
+    }
+    drop(stmt);
+
+    // PnL aggregates from closed positions
+    let mut stmt = conn.prepare(
+        "SELECT pnl_sol FROM positions WHERE status != 'Open' AND pnl_sol IS NOT NULL"
+    )?;
+    let pnl_iter = stmt.query_map([], |row| row.get::<_, f64>(0))?;
+    let mut wins: Vec<f64> = Vec::new();
+    let mut losses: Vec<f64> = Vec::new();
+    for r in pnl_iter {
+        let pnl = r?;
+        if pnl > 0.0 {
+            wins.push(pnl);
+        } else if pnl < 0.0 {
+            losses.push(pnl);
+        }
+        stats.total_pnl_sol += pnl;
+    }
+    drop(stmt);
+
+    stats.winners = wins.len() as u32;
+    stats.losers = losses.len() as u32;
+    if !wins.is_empty() {
+        stats.avg_win_sol = wins.iter().sum::<f64>() / wins.len() as f64;
+        stats.best_win_sol = wins.iter().cloned().fold(f64::MIN, f64::max);
+    }
+    if !losses.is_empty() {
+        stats.avg_loss_sol = losses.iter().sum::<f64>() / losses.len() as f64;
+        stats.worst_loss_sol = losses.iter().cloned().fold(f64::MAX, f64::min);
+    }
+
+    // Source breakdown — token_source column added by Sprint 1 migration
+    let mut stmt = conn.prepare(
+        "SELECT token_source, COUNT(*), COALESCE(SUM(pnl_sol), 0) \
+         FROM positions WHERE status != 'Open' \
+         GROUP BY token_source ORDER BY COUNT(*) DESC"
+    )?;
+    let source_rows = stmt.query_map([], |row| {
+        Ok((
+            row.get::<_, String>(0)?,
+            row.get::<_, u32>(1)?,
+            row.get::<_, f64>(2)?,
+        ))
+    })?;
+    for r in source_rows {
+        stats.by_source.push(r?);
+    }
+    drop(stmt);
+
+    // Trades in last 24h (from trades table)
+    let yesterday = chrono::Utc::now() - chrono::Duration::hours(24);
+    let cutoff = yesterday.to_rfc3339();
+    let count: u32 = conn.query_row(
+        "SELECT COUNT(*) FROM trades WHERE created_at >= ?1",
+        params![cutoff],
+        |row| row.get(0),
+    ).unwrap_or(0);
+    stats.trades_24h = count;
+
+    Ok(stats)
+}

@@ -35,6 +35,8 @@ pub enum Command {
     Settings,
     #[command(description = "Trade history")]
     History,
+    #[command(description = "Performance stats — winrate & PnL")]
+    Stats,
     #[command(description = "Emergency stop — pause auto-buy")]
     Stop,
     #[command(description = "Resume auto-buy after /stop")]
@@ -58,6 +60,7 @@ pub async fn handle_command(
         Command::Wallet => handle_wallet(bot, msg, state).await?,
         Command::Settings => handle_settings(bot, msg, state).await?,
         Command::History => handle_history(bot, msg, state).await?,
+        Command::Stats => handle_stats(bot, msg, state).await?,
         Command::Stop => handle_stop(bot, msg, state).await?,
         Command::Go => handle_go(bot, msg, state).await?,
     }
@@ -679,6 +682,9 @@ async fn handle_help(bot: Bot, msg: Message) -> Result<(), teloxide::RequestErro
 /wallet - Kelola wallet
 /settings - Pengaturan bot
 /history - Riwayat trading
+/stats - Performance stats (winrate, PnL, source breakdown)
+/stop - Pause auto-buy
+/go - Resume auto-buy
 
 <b>Quick Trade:</b>
 Paste alamat token Solana langsung ke chat untuk auto-detect dan lihat info token + tombol beli.
@@ -859,6 +865,99 @@ async fn handle_history(
         vec![]
     });
     let text = history_ui::build_history_message(&trades);
+    bot.send_message(msg.chat.id, text)
+        .parse_mode(ParseMode::Html)
+        .await?;
+    Ok(())
+}
+
+async fn handle_stats(
+    bot: Bot,
+    msg: Message,
+    state: Arc<BotState>,
+) -> Result<(), teloxide::RequestError> {
+    let stats = match db::get_performance_stats(&state.db) {
+        Ok(s) => s,
+        Err(e) => {
+            warn!("Failed to load performance stats: {}", e);
+            let _ = bot
+                .send_message(msg.chat.id, format!("\u{26a0}\u{fe0f} Stats query failed: {}", e))
+                .await;
+            return Ok(());
+        }
+    };
+
+    let closed_total = stats.closed_tp + stats.closed_sl + stats.closed_manual + stats.closed_error;
+    let winrate_pct = if (stats.winners + stats.losers) > 0 {
+        stats.winners as f64 / (stats.winners + stats.losers) as f64 * 100.0
+    } else {
+        0.0
+    };
+
+    let mut text = String::new();
+    text.push_str("\u{1f4ca} <b>Performance Stats</b>\n");
+    text.push_str("\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\n");
+
+    // Position counts
+    text.push_str(&format!(
+        "\u{1f4e6} <b>Positions:</b> {} total\n",
+        stats.total_positions
+    ));
+    text.push_str(&format!(
+        "  \u{1f7e2} Open: {} | TP: {} | SL: {}\n",
+        stats.open, stats.closed_tp, stats.closed_sl
+    ));
+    text.push_str(&format!(
+        "  \u{1f6ab} Manual: {} | Error: {}\n\n",
+        stats.closed_manual, stats.closed_error
+    ));
+
+    // PnL
+    let pnl_emoji = if stats.total_pnl_sol >= 0.0 { "\u{1f4c8}" } else { "\u{1f4c9}" };
+    text.push_str(&format!("{} <b>PnL:</b>\n", pnl_emoji));
+    text.push_str(&format!(
+        "  Total: {:+.6} SOL\n",
+        stats.total_pnl_sol
+    ));
+    text.push_str(&format!(
+        "  Closed: {} | Winners: {} | Losers: {}\n",
+        closed_total, stats.winners, stats.losers
+    ));
+    text.push_str(&format!(
+        "  Winrate: <b>{:.1}%</b>\n",
+        winrate_pct
+    ));
+    if stats.winners > 0 {
+        text.push_str(&format!(
+            "  Avg win: {:+.6} SOL | Best: {:+.6}\n",
+            stats.avg_win_sol, stats.best_win_sol
+        ));
+    }
+    if stats.losers > 0 {
+        text.push_str(&format!(
+            "  Avg loss: {:+.6} SOL | Worst: {:+.6}\n",
+            stats.avg_loss_sol, stats.worst_loss_sol
+        ));
+    }
+    text.push('\n');
+
+    // Source breakdown
+    if !stats.by_source.is_empty() {
+        text.push_str("\u{1f30d} <b>By source:</b>\n");
+        for (src, count, pnl) in &stats.by_source {
+            text.push_str(&format!(
+                "  {}: {} trades, {:+.6} SOL\n",
+                src, count, pnl
+            ));
+        }
+        text.push('\n');
+    }
+
+    text.push_str(&format!(
+        "\u{23f1}\u{fe0f} <b>24h activity:</b> {} trades\n",
+        stats.trades_24h
+    ));
+
     bot.send_message(msg.chat.id, text)
         .parse_mode(ParseMode::Html)
         .await?;

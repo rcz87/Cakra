@@ -198,8 +198,44 @@ impl PositionManager {
 
     /// Mark a position as ClosedError — sell failed after all retries.
     /// This stops TP/SL monitor from re-triggering sell attempts.
+    ///
+    /// IMPORTANT: no-op if the position is already closed (any closed state).
+    /// Without this guard, a successful TP close followed by an echo sell
+    /// command (TP/SL monitor still cycling) would clobber the ClosedTp
+    /// status with ClosedError, even though the trade made profit.
     pub fn close_position_error(&self, mint: &str) -> Result<()> {
+        let already_closed = {
+            let positions = self
+                .positions
+                .read()
+                .map_err(|e| anyhow::anyhow!("Position lock poisoned: {e}"))?;
+            match positions.get(mint) {
+                Some(pos) => !matches!(pos.status, PositionStatus::Open),
+                None => true, // not in cache → effectively closed
+            }
+        };
+
+        if already_closed {
+            warn!(
+                mint = %mint,
+                "close_position_error called on already-closed position — skipping (preserving prior status)"
+            );
+            return Ok(());
+        }
+
         self.close_position_with_status(mint, "sell_failed", PositionStatus::ClosedError)
+    }
+
+    /// Returns true if position exists in cache and status is Open.
+    pub fn is_open(&self, mint: &str) -> bool {
+        let positions = match self.positions.read() {
+            Ok(p) => p,
+            Err(_) => return false,
+        };
+        positions
+            .get(mint)
+            .map(|p| matches!(p.status, PositionStatus::Open))
+            .unwrap_or(false)
     }
 
     fn close_position_with_status(

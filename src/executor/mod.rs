@@ -935,7 +935,12 @@ impl ExecutorService {
     }
 
     /// Sell via PumpPortal Local Trade API (used for PumpFun bonding curve and PumpSwap AMM).
-    /// Avoids Jupiter dependency for tokens that may not be indexed yet.
+    /// Uses source-aware sell slippage with inline escalation on Custom(6024) errors.
+    ///
+    /// PumpFun bonding curve volatility means a normal 5% slippage will routinely
+    /// hit `Custom(6024)` (TooMuchSolRequired) when meme coins dump 50%+ in seconds.
+    /// We start at 25% / 15% by source, then escalate by +500 bps per retry up to
+    /// 3500 bps cap. Only escalates on the 6024 error — other failures bail fast.
     async fn execute_sell_via_pumpportal(
         &self,
         mint: &str,
@@ -957,24 +962,91 @@ impl ExecutorService {
             _ => "auto",
         };
 
+        // Source-aware base sell slippage (much wider than buy)
+        let base_slippage_bps: u16 = match token_source {
+            "PumpFun" => 2500,   // 25% — bonding curve dump volatility
+            "PumpSwap" => 1500,  // 15% — migrated AMM, slightly less wild
+            _ => self.config.default_slippage_bps,
+        };
+        const SLIPPAGE_ESCALATION_BPS: u16 = 500;
+        const SLIPPAGE_HARD_CAP_BPS: u16 = 3500;
+        const MAX_ESCALATION_ATTEMPTS: u32 = 3;
+
         let jito_tip_sol = self.config.jito_tip_lamports as f64 / 1_000_000_000.0;
-        let signature = self
-            .pumpportal
-            .execute_sell(
-                mint,
-                amount_pct,
-                self.config.default_slippage_bps,
-                jito_tip_sol,
-                wallet,
-                pool,
-            )
-            .await
-            .context("PumpPortal sell execution failed")?;
+        let mut current_slippage = base_slippage_bps;
+        let mut signature = String::new();
+        let mut last_error: Option<String> = None;
+
+        for attempt in 0..MAX_ESCALATION_ATTEMPTS {
+            info!(
+                mint = %mint,
+                attempt = attempt + 1,
+                slippage_bps = current_slippage,
+                "PumpPortal sell attempt"
+            );
+
+            match self
+                .pumpportal
+                .execute_sell(mint, amount_pct, current_slippage, jito_tip_sol, wallet, pool)
+                .await
+            {
+                Ok(sig) => {
+                    signature = sig;
+                    break;
+                }
+                Err(e) => {
+                    let err_str = format!("{e:?}");
+                    let is_slippage_error = err_str.contains("6024")
+                        || err_str.contains("TooMuchSolRequired")
+                        || err_str.contains("SlippageExceeded");
+
+                    last_error = Some(err_str.clone());
+
+                    if !is_slippage_error {
+                        warn!(
+                            mint = %mint,
+                            error = %err_str,
+                            "PumpPortal sell failed (non-slippage error), bailing"
+                        );
+                        anyhow::bail!("PumpPortal sell execution failed: {e}");
+                    }
+
+                    // Escalate slippage and retry
+                    let next_slippage = current_slippage.saturating_add(SLIPPAGE_ESCALATION_BPS);
+                    if next_slippage > SLIPPAGE_HARD_CAP_BPS {
+                        warn!(
+                            mint = %mint,
+                            slippage_cap = SLIPPAGE_HARD_CAP_BPS,
+                            "Slippage hard cap reached, no further retries"
+                        );
+                        break;
+                    }
+                    warn!(
+                        mint = %mint,
+                        from_slippage = current_slippage,
+                        to_slippage = next_slippage,
+                        "Slippage error (6024) — escalating slippage and retrying"
+                    );
+                    current_slippage = next_slippage;
+                    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+                }
+            }
+        }
+
+        if signature.is_empty() {
+            anyhow::bail!(
+                "PumpPortal sell failed after {} escalations (max slippage {} bps): {}",
+                MAX_ESCALATION_ATTEMPTS,
+                current_slippage,
+                last_error.unwrap_or_else(|| "unknown".to_string())
+            );
+        }
 
         info!(
             mint = %mint,
             signature = %signature,
             pool = %pool,
+            final_slippage_bps = current_slippage,
             "PumpPortal sell submitted"
         );
 

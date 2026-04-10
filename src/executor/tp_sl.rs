@@ -235,6 +235,17 @@ impl TpSlMonitor {
 
     /// Evaluate a single position for TP/SL conditions.
     async fn evaluate_position(&self, pos: &Position) {
+        // Guard: never trigger sells on already-closed positions.
+        // Without this, the TP/SL monitor can race against the sell executor:
+        // 1. Trailing stop fires → sell command sent
+        // 2. Sell executes successfully → position marked ClosedTp/Sl
+        // 3. Next monitor tick sees same position (still in cache momentarily)
+        // 4. Re-fires trigger → echo sell → "balance is zero" → ClosedError
+        //    overwrites the correct ClosedTp.
+        if !matches!(pos.status, crate::models::position::PositionStatus::Open) {
+            return;
+        }
+
         // ── Stale-price safety net ─────────────────────────────────
         // If price is stale, we don't trust take-profit triggers (data may be ahead
         // of reality). But stop-loss + time-stop must STILL fire — otherwise the bot

@@ -57,6 +57,27 @@ const CPMM_TOKEN_0_PROGRAM_OFFSET: usize = 232;
 const CPMM_TOKEN_1_PROGRAM_OFFSET: usize = 264;
 const CPMM_OBSERVATION_KEY_OFFSET: usize = 296;
 
+/// Raydium AMM v4 (legacy AmmInfo) layout — C-style packed, NOT Anchor.
+/// Pool state account size is ~752 bytes. Key offsets for read-only access:
+///
+/// ```text
+/// 0..8     status (u64)
+/// 8..16    nonce (u64)
+/// ...
+/// 336..368  coin_vault (Pubkey)       — base token vault
+/// 368..400  pc_vault (Pubkey)         — quote token vault (usually WSOL)
+/// 400..432  coin_vault_mint (Pubkey)  — base mint
+/// 432..464  pc_vault_mint (Pubkey)    — quote mint
+/// ```
+const AMM_V4_COIN_VAULT_OFFSET: usize = 336;
+const AMM_V4_PC_VAULT_OFFSET: usize = 368;
+const AMM_V4_COIN_MINT_OFFSET: usize = 400;
+const AMM_V4_PC_MINT_OFFSET: usize = 432;
+const AMM_V4_MIN_DATA_LEN: usize = 752;
+
+/// SPL Token classic program (used by AMM v4 — predates Token-2022).
+const SPL_TOKEN_PROGRAM_ID: &str = "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA";
+
 #[derive(Debug, Clone, PartialEq)]
 pub enum RaydiumPoolKind {
     /// Constant Product Market Maker — Anchor program. Used by PumpSwap migrations.
@@ -108,10 +129,7 @@ pub fn load_pool_meta(rpc: &RpcClient, pool_address: &str) -> Result<RaydiumPool
     if account.owner == cpmm_program {
         decode_cpmm_pool(&pool_pubkey, &account.data)
     } else if account.owner == amm_v4_program {
-        // Sprint 3b will implement this. Return error so dispatcher falls back.
-        // AMM v4 layout differs from CPMM. Most newborns use CPMM so we
-        // deliberately defer this. Returns error → dispatcher falls back to Jupiter.
-        anyhow::bail!("AMM v4 pool reader not implemented — use Jupiter fallback")
+        decode_amm_v4_pool(&pool_pubkey, &account.data)
     } else {
         anyhow::bail!(
             "Pool {} owned by unknown program {}",
@@ -119,6 +137,67 @@ pub fn load_pool_meta(rpc: &RpcClient, pool_address: &str) -> Result<RaydiumPool
             account.owner
         )
     }
+}
+
+/// Decode a Raydium AMM v4 pool state. Read-only.
+/// Note: AMM v4 swap building is NOT supported here — it requires Serum/OpenBook
+/// market accounts (asks, bids, event_queue, vault_signer, etc.) which is a
+/// large surface area. Use Jupiter for AMM v4 swaps.
+fn decode_amm_v4_pool(pool: &Pubkey, data: &[u8]) -> Result<RaydiumPoolMeta> {
+    if data.len() < AMM_V4_MIN_DATA_LEN {
+        anyhow::bail!(
+            "AMM v4 pool data too short: {} bytes (need at least {})",
+            data.len(),
+            AMM_V4_MIN_DATA_LEN
+        );
+    }
+
+    let coin_vault = read_pubkey(data, AMM_V4_COIN_VAULT_OFFSET)?;
+    let pc_vault = read_pubkey(data, AMM_V4_PC_VAULT_OFFSET)?;
+    let coin_mint = read_pubkey(data, AMM_V4_COIN_MINT_OFFSET)?;
+    let pc_mint = read_pubkey(data, AMM_V4_PC_MINT_OFFSET)?;
+
+    let wsol: Pubkey = WSOL_MINT.parse().unwrap();
+    let token_program: Pubkey = SPL_TOKEN_PROGRAM_ID.parse().unwrap();
+
+    // Determine which side is the project token (non-WSOL)
+    let (token_mint, token_vault, sol_vault) = if coin_mint == wsol {
+        (pc_mint, pc_vault, coin_vault)
+    } else if pc_mint == wsol {
+        (coin_mint, coin_vault, pc_vault)
+    } else {
+        anyhow::bail!(
+            "AMM v4 pool {} has no WSOL side ({} / {})",
+            pool, coin_mint, pc_mint
+        );
+    };
+
+    debug!(
+        pool = %pool,
+        token_mint = %token_mint,
+        token_vault = %token_vault,
+        sol_vault = %sol_vault,
+        "Decoded AMM v4 pool meta (read-only)"
+    );
+
+    // AMM v4 has no amm_config or observation_state in the same sense as CPMM.
+    // We populate them with default Pubkey values — they're only used by the
+    // CPMM swap builder, which AMM v4 must not call. Direct AMM v4 swap is
+    // unsupported (Serum market accounts required).
+    Ok(RaydiumPoolMeta {
+        pool: *pool,
+        kind: RaydiumPoolKind::AmmV4,
+        token_mint,
+        token_vault,
+        sol_vault,
+        // These fields are not meaningful for AMM v4 — placeholder defaults
+        // ensure the struct can be returned. Any caller that tries to build
+        // a CPMM swap with kind=AmmV4 should be guarded against this.
+        amm_config: Pubkey::default(),
+        observation_state: Pubkey::default(),
+        token_program,
+        sol_program: token_program,
+    })
 }
 
 fn decode_cpmm_pool(pool: &Pubkey, data: &[u8]) -> Result<RaydiumPoolMeta> {
@@ -302,6 +381,14 @@ pub fn build_cpmm_swap_ix(
     amount_in: u64,
     minimum_amount_out: u64,
 ) -> Result<Instruction> {
+    // Guard: refuse to build CPMM swap for AMM v4 pool — different program, different layout.
+    if meta.kind != RaydiumPoolKind::Cpmm {
+        anyhow::bail!(
+            "build_cpmm_swap_ix called with non-CPMM pool kind {:?}",
+            meta.kind
+        );
+    }
+
     let program_id: Pubkey = CPMM_PROGRAM_ID.parse().context("Invalid CPMM program ID")?;
     let (authority, _bump) = derive_cpmm_authority()?;
 
@@ -524,5 +611,40 @@ mod tests {
         let price = pool_price_per_base_unit(100_000_000_000, 1_000_000).unwrap();
         // 100 SOL / 1M base units = 1e-4 SOL per base unit
         assert!((price - 0.0001).abs() < 1e-9);
+    }
+
+    #[test]
+    fn test_cpmm_swap_rejects_amm_v4_meta() {
+        use solana_sdk::signature::Keypair;
+        use solana_sdk::signer::Signer;
+
+        let kp = Keypair::new();
+        let payer = kp.pubkey();
+
+        // Build a fake AMM v4 meta — must be rejected by CPMM swap builder
+        let meta = RaydiumPoolMeta {
+            pool: Pubkey::new_unique(),
+            kind: RaydiumPoolKind::AmmV4,
+            token_mint: Pubkey::new_unique(),
+            token_vault: Pubkey::new_unique(),
+            sol_vault: Pubkey::new_unique(),
+            amm_config: Pubkey::default(),
+            observation_state: Pubkey::default(),
+            token_program: SPL_TOKEN_PROGRAM_ID.parse().unwrap(),
+            sol_program: SPL_TOKEN_PROGRAM_ID.parse().unwrap(),
+        };
+
+        let result = build_cpmm_swap_ix(
+            &meta, &payer, &Pubkey::new_unique(), &Pubkey::new_unique(),
+            true, 1000, 100,
+        );
+        assert!(result.is_err(), "CPMM builder must reject AMM v4 meta");
+    }
+
+    #[test]
+    fn test_cpmm_authority_pda_derives() {
+        let (auth, _bump) = derive_cpmm_authority().unwrap();
+        // Just verify it produces a deterministic, non-default pubkey
+        assert_ne!(auth, Pubkey::default());
     }
 }

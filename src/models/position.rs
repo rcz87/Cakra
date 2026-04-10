@@ -49,6 +49,11 @@ pub struct Position {
     pub price_stale: bool,
     /// Last successful price update timestamp (RFC3339)
     pub last_price_at: Option<DateTime<Utc>>,
+    /// Wallet SOL balance (in SOL, not lamports) at the moment of buy.
+    /// Used to compute REALIZED PnL on close = current_wallet_sol - wallet_sol_at_open.
+    /// Without this, pnl_sol drifts to the fantasy spot-price PnL because PriceFeed
+    /// reports bonding curve spot, not actual exit value after slippage.
+    pub wallet_sol_at_open: f64,
 }
 
 impl Position {

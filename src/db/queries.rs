@@ -206,7 +206,8 @@ pub fn get_open_positions(db: &DbPool) -> Result<Vec<Position>> {
          entry_amount_sol, token_amount, current_price_sol, highest_price_sol, \
          take_profit_pct, stop_loss_pct, trailing_stop_pct, pnl_sol, pnl_pct, \
          status, buy_tx, sell_tx, opened_at, closed_at, security_score, \
-         token_source, pool_address, token_decimals, price_source, price_stale, last_price_at \
+         token_source, pool_address, token_decimals, price_source, price_stale, last_price_at, \
+         wallet_sol_at_open \
          FROM positions WHERE status = 'Open' ORDER BY opened_at DESC"
     )?;
     let rows = stmt.query_map([], |row| {
@@ -250,6 +251,7 @@ pub fn get_open_positions(db: &DbPool) -> Result<Vec<Position>> {
             last_price_at: last_price_str
                 .and_then(|s| chrono::DateTime::parse_from_rfc3339(&s).ok())
                 .map(|dt| dt.with_timezone(&chrono::Utc)),
+            wallet_sol_at_open: row.get::<_, Option<f64>>(26)?.unwrap_or(0.0),
         })
     })?;
     Ok(rows.filter_map(|r| r.ok()).collect())
@@ -375,9 +377,14 @@ pub fn get_performance_stats(db: &DbPool) -> Result<PerformanceStats> {
     }
     drop(stmt);
 
-    // PnL aggregates from closed positions
+    // PnL aggregates from closed positions.
+    // Sanity filter: |pnl_sol| < 1.0 SOL — protects against phantom data from
+    // pre-Sprint-1 unit bug (entry_price was 10^6 off, producing -4999 SOL fakes).
+    // Position size cap is 0.005 SOL, so even a 100x win is < 0.5 SOL.
     let mut stmt = conn.prepare(
-        "SELECT pnl_sol FROM positions WHERE status != 'Open' AND pnl_sol IS NOT NULL"
+        "SELECT pnl_sol FROM positions \
+         WHERE status != 'Open' AND pnl_sol IS NOT NULL \
+         AND ABS(pnl_sol) < 1.0"
     )?;
     let pnl_iter = stmt.query_map([], |row| row.get::<_, f64>(0))?;
     let mut wins: Vec<f64> = Vec::new();
@@ -404,9 +411,10 @@ pub fn get_performance_stats(db: &DbPool) -> Result<PerformanceStats> {
         stats.worst_loss_sol = losses.iter().cloned().fold(f64::MAX, f64::min);
     }
 
-    // Source breakdown — token_source column added by Sprint 1 migration
+    // Source breakdown — token_source column added by Sprint 1 migration.
+    // Same sanity filter applied to PnL sum.
     let mut stmt = conn.prepare(
-        "SELECT token_source, COUNT(*), COALESCE(SUM(pnl_sol), 0) \
+        "SELECT token_source, COUNT(*), COALESCE(SUM(CASE WHEN ABS(pnl_sol) < 1.0 THEN pnl_sol ELSE 0 END), 0) \
          FROM positions WHERE status != 'Open' \
          GROUP BY token_source ORDER BY COUNT(*) DESC"
     )?;

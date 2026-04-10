@@ -85,6 +85,18 @@ impl ExecutorService {
         }
     }
 
+    /// Read wallet SOL balance (in SOL, not lamports). Used as a snapshot
+    /// at buy time to compute realized PnL on close.
+    fn read_wallet_sol_balance(&self, wallet: &Pubkey) -> f64 {
+        match self.rpc.get_balance(wallet) {
+            Ok(lamports) => lamports as f64 / 1_000_000_000.0,
+            Err(e) => {
+                warn!(error = %e, "Failed to read wallet SOL balance, returning 0");
+                0.0
+            }
+        }
+    }
+
     /// Execute a buy for a given token. Returns the transaction signature on success.
     pub async fn execute_buy(
         &self,
@@ -105,6 +117,15 @@ impl ExecutorService {
         if self.lists.is_blacklisted(&token.mint)? {
             anyhow::bail!("Token {} is blacklisted", token.mint);
         }
+
+        // Snapshot wallet SOL balance BEFORE any spending — used to compute
+        // realized PnL on close (truth-from-balance, not spot-price fantasy).
+        let wallet_sol_at_open = self.read_wallet_sol_balance(&wallet.pubkey());
+        info!(
+            mint = %token.mint,
+            wallet_sol_at_open,
+            "Captured wallet snapshot for realized PnL tracking"
+        );
 
         // Risk manager check
         match self.risk.can_trade(amount_sol)? {
@@ -235,6 +256,7 @@ impl ExecutorService {
                 token.pool_address.clone(),
                 token.decimals,
                 price_source,
+                wallet_sol_at_open,
             )?;
 
             self.cooldown.record_trade(&taker);
@@ -578,6 +600,7 @@ impl ExecutorService {
             token.pool_address.clone(),
             token.decimals,
             price_source,
+            wallet_sol_at_open,
         )?;
 
         // Record trade in DB as Confirmed (bundle already landed)
@@ -896,6 +919,13 @@ impl ExecutorService {
             }
         };
 
+        // REALIZED PnL: read wallet SOL after sell + verify, compare to wallet_sol_at_open.
+        // Must happen BEFORE close_position* so the realized field is persisted.
+        let current_wallet = self.read_wallet_sol_balance(&wallet.pubkey());
+        if let Err(e) = self.positions.update_pnl_realized(mint, current_wallet) {
+            warn!(mint = %mint, error = %e, "Failed to update realized PnL");
+        }
+
         // Update position tracking based on actual sell
         if post_balance == 0 {
             self.positions.close_position(mint, &signature)?;
@@ -1082,6 +1112,12 @@ impl ExecutorService {
             }
         };
 
+        // REALIZED PnL update from wallet delta (PumpPortal path)
+        let current_wallet = self.read_wallet_sol_balance(&wallet.pubkey());
+        if let Err(e) = self.positions.update_pnl_realized(mint, current_wallet) {
+            warn!(mint = %mint, error = %e, "Failed to update realized PnL (PumpPortal)");
+        }
+
         // Update position bookkeeping
         if post_balance == 0 {
             self.positions.close_position(mint, &signature)?;
@@ -1221,6 +1257,12 @@ impl ExecutorService {
                 anyhow::bail!("RaydiumDirect sell verification failed: {}", reason);
             }
         };
+
+        // REALIZED PnL update from wallet delta (RaydiumDirect path)
+        let current_wallet = self.read_wallet_sol_balance(&wallet.pubkey());
+        if let Err(e) = self.positions.update_pnl_realized(mint, current_wallet) {
+            warn!(mint = %mint, error = %e, "Failed to update realized PnL (RaydiumDirect)");
+        }
 
         if post_balance == 0 {
             self.positions.close_position(mint, &signature)?;

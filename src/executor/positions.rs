@@ -61,6 +61,7 @@ impl PositionManager {
         pool_address: Option<String>,
         token_decimals: u8,
         price_source: Option<String>,
+        wallet_sol_at_open: f64,
     ) -> Result<Position> {
         let position = Position {
             id: Uuid::new_v4().to_string(),
@@ -84,6 +85,7 @@ impl PositionManager {
             price_source,
             price_stale: false,
             last_price_at: None,
+            wallet_sol_at_open,
             buy_tx: buy_tx.to_string(),
             sell_tx: None,
             opened_at: Utc::now(),
@@ -127,6 +129,56 @@ impl PositionManager {
             pos.update_pnl(price);
         } else {
             warn!(mint = %mint, "No open position found to update price");
+        }
+
+        Ok(())
+    }
+
+    /// Set REALIZED PnL based on actual wallet SOL delta from buy to current.
+    /// This replaces the spot-price fantasy PnL with truth-from-balance.
+    ///
+    /// Call this AFTER a successful sell verifies, BEFORE close_position*().
+    /// Formula: realized = current_wallet_sol - position.wallet_sol_at_open
+    ///
+    /// This naturally accounts for:
+    ///   - Buy fees + ATA rent + Jito tip
+    ///   - Sell fees + Jito tip
+    ///   - Slippage on both sides
+    ///   - The actual SOL received vs theoretical
+    pub fn update_pnl_realized(&self, mint: &str, current_wallet_sol: f64) -> Result<()> {
+        let mut positions = self
+            .positions
+            .write()
+            .map_err(|e| anyhow::anyhow!("Position lock poisoned: {e}"))?;
+
+        if let Some(pos) = positions.get_mut(mint) {
+            if pos.wallet_sol_at_open <= 0.0 {
+                warn!(
+                    mint = %mint,
+                    "Cannot compute realized PnL — wallet_sol_at_open not recorded"
+                );
+                return Ok(());
+            }
+            let realized = current_wallet_sol - pos.wallet_sol_at_open;
+            // Compute pct based on entry amount (the trade size, not full wallet)
+            let pct = if pos.entry_amount_sol > 0.0 {
+                (realized / pos.entry_amount_sol) * 100.0
+            } else {
+                0.0
+            };
+            info!(
+                mint = %mint,
+                wallet_at_open = pos.wallet_sol_at_open,
+                wallet_now = current_wallet_sol,
+                realized_pnl_sol = realized,
+                realized_pnl_pct = pct,
+                fantasy_pnl_was = pos.pnl_sol,
+                "Updating to REALIZED PnL"
+            );
+            pos.pnl_sol = realized;
+            pos.pnl_pct = pct;
+        } else {
+            warn!(mint = %mint, "No open position found for realized PnL update");
         }
 
         Ok(())
@@ -462,7 +514,8 @@ impl PositionManager {
                  entry_amount_sol, token_amount, current_price_sol, highest_price_sol, \
                  take_profit_pct, stop_loss_pct, trailing_stop_pct, pnl_sol, pnl_pct, \
                  status, buy_tx, sell_tx, opened_at, closed_at, security_score, \
-                 token_source, pool_address, token_decimals, price_source, price_stale, last_price_at \
+                 token_source, pool_address, token_decimals, price_source, price_stale, last_price_at, \
+                 wallet_sol_at_open \
                  FROM positions WHERE status = 'Open'",
             )
             .context("Failed to prepare positions query")?;
@@ -516,6 +569,7 @@ impl PositionManager {
                         .ok().flatten()
                         .and_then(|s| chrono::DateTime::parse_from_rfc3339(&s).ok())
                         .map(|dt| dt.with_timezone(&Utc)),
+                    wallet_sol_at_open: row.get::<_, Option<f64>>(26).ok().flatten().unwrap_or(0.0),
                 })
             })
             .context("Failed to query positions")?;
@@ -558,8 +612,9 @@ impl PositionManager {
               entry_amount_sol, token_amount, current_price_sol, highest_price_sol, \
               take_profit_pct, stop_loss_pct, trailing_stop_pct, pnl_sol, pnl_pct, \
               status, buy_tx, sell_tx, opened_at, closed_at, security_score, \
-              token_source, pool_address, token_decimals, price_source, price_stale, last_price_at) \
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26)",
+              token_source, pool_address, token_decimals, price_source, price_stale, last_price_at, \
+              wallet_sol_at_open) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26, ?27)",
             rusqlite::params![
                 position.id,
                 position.token_mint,
@@ -587,6 +642,7 @@ impl PositionManager {
                 position.price_source,
                 position.price_stale as i32,
                 position.last_price_at.map(|t| t.to_rfc3339()),
+                position.wallet_sol_at_open,
             ],
         )
         .context("Failed to persist position")?;

@@ -135,6 +135,9 @@ fn run_migrations(conn: &Connection) -> Result<()> {
          "ALTER TABLE positions ADD COLUMN price_stale INTEGER NOT NULL DEFAULT 0"),
         ("002_positions_last_price_at",
          "ALTER TABLE positions ADD COLUMN last_price_at TEXT"),
+        // Migration 003: realized PnL via wallet snapshot
+        ("003_positions_wallet_sol_at_open",
+         "ALTER TABLE positions ADD COLUMN wallet_sol_at_open REAL NOT NULL DEFAULT 0"),
     ];
 
     for (name, sql) in migrations {

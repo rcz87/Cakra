@@ -398,19 +398,12 @@ async fn main() -> Result<()> {
                                     Ok(EntryDecision::Reject(reason)) => {
                                         warn!(
                                             mint = %token.mint,
+                                            symbol = %token.symbol,
+                                            score = combined_score,
                                             reason = %reason,
                                             "Entry confirmation rejected, skipping buy"
                                         );
-                                        let _ = tg_bot.send_message(
-                                            tg_chat,
-                                            format!(
-                                                "\u{26a0}\u{fe0f} <b>Entry Rejected</b>\n\n\
-                                                 \u{1f4e6} {} (<code>{}</code>)\n\
-                                                 \u{1f6e1}\u{fe0f} Score: {}/100\n\
-                                                 \u{274c} Reason: {}",
-                                                token.symbol, token.mint, score, reason
-                                            ),
-                                        ).parse_mode(teloxide::types::ParseMode::Html).await;
+                                        // No Telegram notification — log only to avoid spam
                                         continue;
                                     }
                                     Err(e) => {
@@ -610,6 +603,7 @@ async fn main() -> Result<()> {
     let sell_executor = executor.clone();
     let sell_wallet = wallet_manager.clone();
     let sell_password = wallet_password.clone();
+    let sell_positions = position_manager.clone();
     let sell_tg_bot = teloxide::Bot::new(&config.telegram_bot_token);
     let sell_tg_chat = teloxide::types::ChatId(config.telegram_admin_chat_id);
     let sell_handle = tokio::spawn(async move {
@@ -716,20 +710,26 @@ async fn main() -> Result<()> {
             }
 
             if !sell_ok {
-                // All 3 retries failed — emergency Telegram alert
+                // All 3 retries failed — mark position as ClosedError
+                // so TP/SL monitor stops re-triggering sell attempts.
                 error!(
                     mint = %mint,
                     sell_pct = sell_pct,
-                    "CRITICAL: Sell failed after 3 retries"
+                    "CRITICAL: Sell failed after 3 retries — marking ClosedError"
                 );
+
+                if let Err(e) = sell_positions.close_position_error(&mint) {
+                    error!(mint = %mint, error = %e, "Failed to mark position as ClosedError");
+                }
+
                 let _ = sell_tg_bot.send_message(
                     sell_tg_chat,
                     format!(
                         "\u{1f6a8} <b>CRITICAL: Sell GAGAL 3x</b>\n\n\
                          \u{274c} Mint: <code>{}</code>\n\
                          \u{1f4ca} Sell %: {}%\n\n\
-                         <b>Bot tidak bisa jual posisi ini!</b>\n\
-                         Segera jual manual via /sell {}",
+                         <b>Posisi di-mark ClosedError — tidak akan retry otomatis.</b>\n\
+                         Jual manual via /sell {}",
                         mint, sell_pct, mint
                     ),
                 ).parse_mode(teloxide::types::ParseMode::Html).await;

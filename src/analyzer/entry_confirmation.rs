@@ -139,12 +139,41 @@ pub async fn confirm_entry(
 ///
 /// Does NOT call any external APIs — pure local data check.
 pub fn confirm_entry_fast(token: &TokenInfo) -> EntryDecision {
-    // Reject if liquidity too low
-    if token.initial_liquidity_sol < 1.0 {
+    // Reject if liquidity too low — min 30 SOL (~$4k) for viable snipe
+    if token.initial_liquidity_sol < 30.0 {
         return EntryDecision::Reject(format!(
-            "Liquidity too low for snipe: {:.2} SOL (min 1.0)",
+            "Liquidity too low for snipe: {:.2} SOL (min 30.0)",
             token.initial_liquidity_sol
         ));
+    }
+
+    // Reject if bonding curve progress < 5% (too early, high rug risk)
+    // PumpFun bonding curve starts at ~30 SOL virtual, migrates at ~85 SOL.
+    // 5% progress ≈ market_cap_sol barely above base.
+    if token.v_sol_in_bonding_curve > 0.0 && token.market_cap_sol > 0.0 {
+        let base_sol = 30.0; // PumpFun base virtual SOL
+        let progress_pct = if token.v_sol_in_bonding_curve > base_sol {
+            ((token.v_sol_in_bonding_curve - base_sol) / base_sol) * 100.0
+        } else {
+            0.0
+        };
+        if progress_pct < 5.0 {
+            return EntryDecision::Reject(format!(
+                "Bonding curve too early: {:.1}% progress (min 5%)",
+                progress_pct
+            ));
+        }
+    }
+
+    // Reject if deployer holds > 10% of supply (via initial_buy / market_cap proxy)
+    if token.market_cap_sol > 0.0 && token.initial_buy_sol > 0.0 {
+        let deployer_pct = (token.initial_buy_sol / token.market_cap_sol) * 100.0;
+        if deployer_pct > 10.0 {
+            return EntryDecision::Reject(format!(
+                "Deployer holds {:.1}% of supply (max 10%)",
+                deployer_pct
+            ));
+        }
     }
 
     // Reject if token source is unknown/unsupported

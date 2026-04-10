@@ -92,6 +92,7 @@ impl AnalyzerService {
             token.initial_liquidity_usd,
             token.initial_liquidity_sol,
             token.market_cap_sol,
+            token.v_sol_in_bonding_curve,
         );
 
         info!(

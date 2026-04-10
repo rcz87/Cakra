@@ -6,12 +6,12 @@ use std::time::{Duration, Instant};
 use tracing::info;
 
 /// Opportunity score factors and their weights.
-const WEIGHT_EARLY_DETECTION: f64 = 20.0;
+const WEIGHT_EARLY_DETECTION: f64 = 15.0;
 const WEIGHT_LIQUIDITY_DEPTH: f64 = 20.0;
 const WEIGHT_BUY_MOMENTUM: f64 = 25.0;
-const WEIGHT_PRICE_STABILITY: f64 = 15.0;
-const WEIGHT_SOL_TREND: f64 = 10.0;
-const WEIGHT_VOLUME_CONSISTENCY: f64 = 10.0;
+const WEIGHT_PRICE_STABILITY: f64 = 10.0;
+const WEIGHT_SOL_TREND: f64 = 15.0;
+const WEIGHT_VOLUME_CONSISTENCY: f64 = 15.0;
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct OpportunityAnalysis {
@@ -41,26 +41,27 @@ pub fn calculate_opportunity_score(analysis: &OpportunityAnalysis) -> u8 {
         0.0
     };
 
-    // Liquidity depth: sweet spot is $5K-$50K
-    let liquidity_score = if analysis.liquidity_usd >= 5_000.0 && analysis.liquidity_usd <= 50_000.0 {
+    // Liquidity depth: sweet spot is $50K-$500K
+    // Framework: min $50k for viable sniping, $100k+ ideal
+    let liquidity_score = if analysis.liquidity_usd >= 50_000.0 && analysis.liquidity_usd <= 500_000.0 {
         100.0
-    } else if analysis.liquidity_usd >= 1_000.0 && analysis.liquidity_usd <= 100_000.0 {
+    } else if analysis.liquidity_usd >= 10_000.0 && analysis.liquidity_usd <= 1_000_000.0 {
         60.0
-    } else if analysis.liquidity_usd >= 500.0 {
-        30.0
+    } else if analysis.liquidity_usd >= 5_000.0 {
+        25.0
     } else {
-        0.0
+        0.0 // <$5K = not viable for snipe
     };
 
     // Buy momentum: unique buyers in early window
-    let momentum_score = if analysis.unique_buyers >= 10 {
+    let momentum_score = if analysis.unique_buyers >= 20 {
         100.0
-    } else if analysis.unique_buyers >= 5 {
+    } else if analysis.unique_buyers >= 10 {
         70.0
-    } else if analysis.unique_buyers >= 3 {
+    } else if analysis.unique_buyers >= 5 {
         40.0
     } else {
-        10.0 // very few buyers, risky
+        5.0 // very few buyers, high risk
     };
 
     // Price stability: hasn't dumped from creation
@@ -86,14 +87,15 @@ pub fn calculate_opportunity_score(analysis: &OpportunityAnalysis) -> u8 {
     };
 
     // Volume consistency: reject whale-dominated tokens
-    let consistency_score = if analysis.largest_buyer_pct <= 20.0 {
+    // Framework: top holder <10% = safe, >20% = high risk
+    let consistency_score = if analysis.largest_buyer_pct <= 10.0 {
         100.0 // well distributed
+    } else if analysis.largest_buyer_pct <= 20.0 {
+        70.0 // acceptable concentration
     } else if analysis.largest_buyer_pct <= 40.0 {
-        60.0 // somewhat concentrated
-    } else if analysis.largest_buyer_pct <= 60.0 {
         30.0 // whale dominated
     } else {
-        0.0 // single whale, very risky
+        0.0 // single whale, very risky — likely rug
     };
 
     let weighted_total = (early_score * WEIGHT_EARLY_DETECTION
@@ -224,12 +226,12 @@ mod tests {
     fn test_perfect_opportunity() {
         let analysis = OpportunityAnalysis {
             buy_count: 3,
-            unique_buyers: 12,
+            unique_buyers: 25,
             seconds_since_creation: 10,
-            liquidity_usd: 15_000.0,
+            liquidity_usd: 100_000.0,
             price_change_pct: 5.0,
             sol_trend_1h_pct: 2.0,
-            largest_buyer_pct: 10.0,
+            largest_buyer_pct: 5.0,
             opportunity_score: 0,
         };
         let score = calculate_opportunity_score(&analysis);

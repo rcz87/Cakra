@@ -84,23 +84,36 @@ pub fn calculate_score(
         0.0
     };
 
-    let liq_usd_score = if effective_liquidity_usd >= 10_000.0 {
+    let liq_usd_score = if effective_liquidity_usd >= 50_000.0 {
         100.0
-    } else if effective_liquidity_usd >= 1_000.0 {
-        50.0
+    } else if effective_liquidity_usd >= 10_000.0 {
+        60.0
+    } else if effective_liquidity_usd >= 5_000.0 {
+        30.0
     } else {
-        0.0
+        0.0  // <$5K = not viable for trading
     };
-    let mcap_score = if market_cap_sol >= 50.0 {
+    let mcap_score = if market_cap_sol >= 80.0 {
         100.0
-    } else if market_cap_sol >= 20.0 {
+    } else if market_cap_sol >= 50.0 {
         70.0
-    } else if market_cap_sol >= 5.0 {
+    } else if market_cap_sol >= 30.0 {
         40.0
     } else {
         0.0
     };
-    let liquidity_score = f64::max(liq_usd_score, mcap_score);
+    // Liquidity/MCAP ratio check — penalize if ratio < 0.6%
+    let liq_mcap_ratio = if market_cap_sol > 0.0 && initial_liquidity_sol > 0.0 {
+        (initial_liquidity_sol / market_cap_sol) * 100.0
+    } else {
+        0.0
+    };
+    let ratio_penalty = if liq_mcap_ratio >= 0.6 || liq_mcap_ratio == 0.0 {
+        1.0  // ratio OK or no data — no penalty
+    } else {
+        0.5  // ratio too low — halve liquidity score
+    };
+    let liquidity_score = f64::max(liq_usd_score, mcap_score) * ratio_penalty;
 
     let weighted_total = (mint_score * WEIGHT_MINT_RENOUNCED
         + freeze_score * WEIGHT_FREEZE_AUTH
@@ -114,7 +127,19 @@ pub fn calculate_score(
         + liquidity_score * WEIGHT_LIQUIDITY)
         / 100.0;
 
-    let final_score = weighted_total.round().clamp(0.0, 100.0) as u8;
+    let mut final_score = weighted_total.round().clamp(0.0, 100.0) as u8;
+
+    // Hard cap: mint not renounced OR freeze authority active → max 30
+    // These are critical red flags for non-PumpFun tokens.
+    // Score 30 ensures it can NEVER pass auto-buy threshold (55+).
+    if !analysis.mint_renounced || !analysis.freeze_authority_null {
+        final_score = final_score.min(30);
+    }
+
+    // Hard cap: confirmed honeypot → score 0
+    if matches!(analysis.honeypot_result, HoneypotResult::Honeypot) {
+        final_score = 0;
+    }
 
     info!(
         final_score,
@@ -141,22 +166,73 @@ pub fn calculate_score(
 /// LP not burned, creator unknown. These fields are USELESS for scoring
 /// because they're identical for every token.
 ///
-/// What DOES differ:
-/// - initial_buy_sol: creator's skin in the game (0.001 vs 10 SOL = huge signal)
-/// - market_cap_sol: how much SOL in the bonding curve
-/// - honeypot_result: can we actually sell this token?
-/// - rugcheck_score: third-party safety rating
-///
 /// Scoring philosophy: filter by BEHAVIOR, not by checkboxes.
+///
+/// Hard reject criteria (score = 0):
+/// - Creator has ANY rug history
+/// - Creator holds > 10% of bonding curve
+/// - Confirmed honeypot
+///
+/// Parameters:
+/// - `initial_liquidity_sol` = creator's initial buy (solAmount from PumpPortal)
+/// - `market_cap_sol` = marketCapSol at detection
+/// - `v_sol_in_bonding_curve` = virtual SOL in bonding curve (for progress calc)
 pub fn calculate_score_fast(
     analysis: &SecurityAnalysis,
     initial_liquidity_usd: f64,
     initial_liquidity_sol: f64,
     market_cap_sol: f64,
+    v_sol_in_bonding_curve: f64,
 ) -> u8 {
-    // === Signal 1: Creator's initial buy (35% weight) ===
-    // Biggest differentiator. Creator who buys 5+ SOL = serious.
-    // Creator who buys 0.01 SOL = likely rug.
+    // ══════════════════════════════════════════════════
+    // HARD REJECTS — instant score 0
+    // ══════════════════════════════════════════════════
+
+    // Deployer rug ≥ 1 → reject
+    if matches!(analysis.creator_history, CreatorHistory::Rugger { .. }) {
+        info!(
+            initial_buy_sol = initial_liquidity_sol,
+            market_cap_sol,
+            "Fast score: HARD REJECT — creator is rugger"
+        );
+        return 0;
+    }
+
+    // Confirmed honeypot → reject
+    if matches!(analysis.honeypot_result, HoneypotResult::Honeypot) {
+        info!(
+            initial_buy_sol = initial_liquidity_sol,
+            market_cap_sol,
+            "Fast score: HARD REJECT — confirmed honeypot"
+        );
+        return 0;
+    }
+
+    // Deployer holds > 10% of bonding curve → HARD REJECT
+    // Can dump and crash price at any time
+    let deployer_hold_pct = if v_sol_in_bonding_curve > 0.0 {
+        (initial_liquidity_sol / v_sol_in_bonding_curve) * 100.0
+    } else if market_cap_sol > 0.0 {
+        (initial_liquidity_sol / market_cap_sol) * 100.0
+    } else {
+        0.0
+    };
+    if deployer_hold_pct > 10.0 {
+        info!(
+            deployer_hold_pct,
+            initial_buy_sol = initial_liquidity_sol,
+            v_sol_in_bonding_curve,
+            "Fast score: HARD REJECT — deployer holds >10%"
+        );
+        return 0;
+    }
+
+    // ══════════════════════════════════════════════════
+    // SCORING SIGNALS
+    // ══════════════════════════════════════════════════
+
+    // === Signal 1: Creator's initial buy (30% weight) ===
+    // Skin in the game. Creator who buys 5+ SOL = serious.
     let creator_buy_score = if initial_liquidity_sol >= 10.0 {
         100.0
     } else if initial_liquidity_sol >= 5.0 {
@@ -164,29 +240,42 @@ pub fn calculate_score_fast(
     } else if initial_liquidity_sol >= 2.0 {
         65.0
     } else if initial_liquidity_sol >= 1.0 {
-        45.0
+        40.0
     } else if initial_liquidity_sol >= 0.5 {
-        25.0
+        20.0
     } else {
-        5.0  // Tiny buy = very suspicious
+        0.0  // Tiny buy = very suspicious, no points
     };
 
-    // === Signal 2: Market cap at detection (25% weight) ===
-    // Higher mcap = more people already bought = more momentum
-    let mcap_score = if market_cap_sol >= 80.0 {
-        100.0
-    } else if market_cap_sol >= 50.0 {
-        80.0
-    } else if market_cap_sol >= 35.0 {
-        55.0
-    } else if market_cap_sol >= 28.0 {
-        30.0  // Base PumpFun mcap (~28 SOL) = nobody bought yet
+    // === Signal 2: Bonding curve progress + momentum (25% weight) ===
+    // PumpFun bonding curve: starts ~30 SOL virtual, migrates to Raydium at ~85 SOL.
+    // Progress = how far along the curve. Sweet spot: 10-50% (early enough for upside).
+    let base_v_sol = 30.0; // PumpFun base virtual SOL in bonding curve
+    let curve_progress = if v_sol_in_bonding_curve > base_v_sol {
+        ((v_sol_in_bonding_curve - base_v_sol) / base_v_sol) * 100.0
     } else {
-        10.0
+        // Fallback to mcap if no bonding curve data
+        if market_cap_sol > 28.0 {
+            ((market_cap_sol - 28.0) / 28.0) * 100.0
+        } else {
+            0.0
+        }
+    };
+
+    // Score: sweet spot 10-50% progress. Too early (<5%) = risky, too late (>70%) = limited upside
+    let mcap_score = if curve_progress >= 10.0 && curve_progress <= 50.0 {
+        100.0  // Sweet spot — good momentum + upside
+    } else if curve_progress > 50.0 && curve_progress <= 80.0 {
+        75.0   // Late but still potential (approaching migration)
+    } else if curve_progress > 80.0 {
+        50.0   // Very late — limited upside before migration
+    } else if curve_progress >= 5.0 {
+        60.0   // Early — some momentum starting
+    } else {
+        10.0   // Too early (<5%) — nobody bought yet, high rug risk
     };
 
     // === Signal 3: Honeypot check (20% weight) ===
-    // Can we actually sell? Critical for not getting trapped.
     let honeypot_score = match analysis.honeypot_result {
         HoneypotResult::Safe { buy_tax, sell_tax } => {
             if buy_tax < 5.0 && sell_tax < 5.0 {
@@ -196,38 +285,52 @@ pub fn calculate_score_fast(
             }
         }
         HoneypotResult::HighTax { .. } => 20.0,
-        HoneypotResult::Honeypot => 0.0,
+        HoneypotResult::Honeypot => 0.0,  // Already hard-rejected above
         HoneypotResult::Unknown => 40.0,  // Neutral — can't check on brand new tokens
     };
 
     // === Signal 4: RugCheck score (10% weight) ===
     let rugcheck_score = analysis.rugcheck_score.unwrap_or(50.0).clamp(0.0, 100.0);
 
-    // === Signal 5: Creator history (10% weight) ===
+    // === Signal 5: Creator history (15% weight) ===
+    // Framework: successful launches = strong signal, suspicious = near-zero
     let creator_score = match analysis.creator_history {
         CreatorHistory::Clean { tokens_created } => {
             if tokens_created >= 3 { 100.0 } else { 70.0 }
         }
-        CreatorHistory::Suspicious { .. } => 15.0,
-        CreatorHistory::Rugger { .. } => 0.0,
-        CreatorHistory::Unknown => 40.0,
+        CreatorHistory::Suspicious { .. } => 10.0,  // 1 rug now = Rugger, this is edge cases
+        CreatorHistory::Rugger { .. } => 0.0,       // Already hard-rejected above
+        CreatorHistory::Unknown => 35.0,
     };
 
     // Weights (sum = 100)
-    const W_CREATOR_BUY: f64 = 35.0;
+    const W_CREATOR_BUY: f64 = 30.0;
     const W_MCAP: f64 = 25.0;
     const W_HONEYPOT: f64 = 20.0;
+    const W_CREATOR: f64 = 15.0;
     const W_RUGCHECK: f64 = 10.0;
-    const W_CREATOR: f64 = 10.0;
 
     let weighted = (creator_buy_score * W_CREATOR_BUY
         + mcap_score * W_MCAP
         + honeypot_score * W_HONEYPOT
-        + rugcheck_score * W_RUGCHECK
-        + creator_score * W_CREATOR)
+        + creator_score * W_CREATOR
+        + rugcheck_score * W_RUGCHECK)
         / 100.0;
 
-    let final_score = weighted.round().clamp(0.0, 100.0) as u8;
+    let mut final_score = weighted.round().clamp(0.0, 100.0) as u8;
+
+    // ══════════════════════════════════════════════════
+    // SOFT CAPS
+    // ══════════════════════════════════════════════════
+
+    // Deployer holds 5-10% → caution, cap at 50 (borderline auto-buy)
+    if deployer_hold_pct > 5.0 {
+        final_score = final_score.min(50);
+        info!(
+            deployer_hold_pct,
+            "Fast score: soft cap 50 — deployer holds 5-10%"
+        );
+    }
 
     info!(
         final_score,

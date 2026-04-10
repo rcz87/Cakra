@@ -43,8 +43,9 @@ impl CreatorCache {
     }
 }
 
-/// Minimum number of rugs to classify creator as a serial rugger.
-const RUG_THRESHOLD: u32 = 2;
+/// Minimum number of rugs to classify creator as a rugger.
+/// Framework: even 1 rug = instant reject.
+const RUG_THRESHOLD: u32 = 1;
 
 /// If liquidity is removed within this many slots after creation, it's suspicious.
 const QUICK_REMOVE_SLOT_WINDOW: u64 = 1000;

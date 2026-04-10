@@ -158,6 +158,12 @@ impl PositionManager {
         self.close_position_with_status(mint, sell_tx, PositionStatus::ClosedSl)
     }
 
+    /// Mark a position as ClosedError — sell failed after all retries.
+    /// This stops TP/SL monitor from re-triggering sell attempts.
+    pub fn close_position_error(&self, mint: &str) -> Result<()> {
+        self.close_position_with_status(mint, "sell_failed", PositionStatus::ClosedError)
+    }
+
     fn close_position_with_status(
         &self,
         mint: &str,

@@ -49,8 +49,15 @@ struct DsResponse {
 }
 
 /// Fetch enrichment data for a mint. Returns the SOL-quoted pair matching
-/// `preferred_dex` if available, otherwise the highest-liquidity SOL pair,
-/// otherwise `None`.
+/// `preferred_dex` if available. If `preferred_dex` is set but not indexed
+/// yet, returns `None` instead of falling back to an arbitrary SOL pair —
+/// this prevents returning the stale pre-migration pumpfun bonding curve
+/// pair (which has `liquidity: null` on DexScreener) as if it were the
+/// freshly-minted AMM pool. The caller can treat "no pair" as a retry
+/// signal instead of acting on wrong data.
+///
+/// If `preferred_dex` is empty, falls back to the highest-liquidity SOL pair
+/// — this path is for non-migration lookups that have no preference.
 ///
 /// `preferred_dex` examples: "pumpswap" (from pump-amm migration),
 /// "raydium" (raydium-cpmm migration).
@@ -93,29 +100,37 @@ pub async fn fetch_enrichment(
         return Ok(None);
     }
 
-    // Prefer the dex matching the migration pool; fall back to highest
-    // liquidity. Both branches deterministic.
-    // NaN-safe: treat NaN as Equal to avoid panic from `partial_cmp.unwrap`.
+    Ok(select_pair(candidates, preferred_dex))
+}
+
+/// Pick the best pair from a list of SOL-quoted candidates.
+///
+/// If `preferred_dex` is non-empty, returns the highest-liquidity pair whose
+/// `dex_id` matches (case-insensitive), or `None` if no match exists — this
+/// is the migration-enrichment path and we MUST NOT fall back to a different
+/// dex, because doing so picks up stale pre-migration pumpfun pairs.
+///
+/// If `preferred_dex` is empty, returns the highest-liquidity pair across
+/// all candidates — this is the "no preference" path for generic lookups.
+fn select_pair(mut candidates: Vec<EnrichedPair>, preferred_dex: &str) -> Option<EnrichedPair> {
+    // NaN-safe comparator — treat NaN as Equal to avoid panic.
     let cmp_by_liq = |a: &EnrichedPair, b: &EnrichedPair| {
         a.liquidity_usd
             .partial_cmp(&b.liquidity_usd)
             .unwrap_or(std::cmp::Ordering::Equal)
     };
 
-    let preferred_matches: Vec<EnrichedPair> = candidates
-        .iter()
-        .filter(|p| p.dex_id.eq_ignore_ascii_case(preferred_dex))
-        .cloned()
-        .collect();
+    if !preferred_dex.is_empty() {
+        // Strict mode: preference was specified, refuse to fall back.
+        return candidates
+            .into_iter()
+            .filter(|p| p.dex_id.eq_ignore_ascii_case(preferred_dex))
+            .max_by(cmp_by_liq);
+    }
 
-    let chosen = if !preferred_matches.is_empty() {
-        preferred_matches.into_iter().max_by(cmp_by_liq)
-    } else {
-        candidates.sort_by(|a, b| cmp_by_liq(b, a)); // descending
-        candidates.into_iter().next()
-    };
-
-    Ok(chosen)
+    // No preference: highest-liquidity wins.
+    candidates.sort_by(|a, b| cmp_by_liq(b, a));
+    candidates.into_iter().next()
 }
 
 /// Parse a DexScreener pair JSON blob into our lean struct. Returns None
@@ -272,6 +287,58 @@ mod tests {
         let p = parse_pair(&v).unwrap();
         assert_eq!(p.market_cap_sol, 0.0);
         assert!(p.market_cap_sol.is_finite());
+    }
+
+    /// Helper: build a minimal EnrichedPair for selection tests.
+    fn mk_pair(dex: &str, liq_usd: f64) -> EnrichedPair {
+        EnrichedPair {
+            pair_address: format!("P_{}_{}", dex, liq_usd as u64),
+            dex_id: dex.to_string(),
+            quote_symbol: "SOL".to_string(),
+            price_native: 1e-7,
+            price_usd: 1e-5,
+            liquidity_usd: liq_usd,
+            liquidity_quote: liq_usd / 150.0,
+            market_cap_usd: 0.0,
+            market_cap_sol: 0.0,
+            fdv_usd: 0.0,
+            pair_created_at_ms: 0,
+        }
+    }
+
+    #[test]
+    fn select_pair_skip_fallback_when_preference_unmatched() {
+        // Regression: migration events fire the moment a pool graduates, but
+        // DexScreener may not have indexed the new pumpswap pair yet — only
+        // the stale pumpfun bonding-curve pair shows up. The old fallback
+        // silently picked that stale pair, producing enrichment_ok=true with
+        // wrong liquidity/mcap. Strict mode must return None in that case.
+        let candidates = vec![mk_pair("pumpfun", 0.0)];
+        assert!(select_pair(candidates, "pumpswap").is_none());
+    }
+
+    #[test]
+    fn select_pair_preferred_match_wins_over_higher_liquidity_other() {
+        // When the preference IS indexed, pick it even if another dex has
+        // higher liquidity. Exact-dex semantics, not best-effort.
+        let candidates = vec![
+            mk_pair("raydium", 100_000.0), // higher liq but wrong dex
+            mk_pair("pumpswap", 500.0),    // preferred
+        ];
+        let chosen = select_pair(candidates, "pumpswap").unwrap();
+        assert_eq!(chosen.dex_id, "pumpswap");
+    }
+
+    #[test]
+    fn select_pair_empty_preference_picks_highest_liquidity() {
+        // Non-migration lookup path: no preference → highest liquidity wins.
+        let candidates = vec![
+            mk_pair("meteora", 100.0),
+            mk_pair("raydium", 5000.0),
+            mk_pair("pumpswap", 1000.0),
+        ];
+        let chosen = select_pair(candidates, "").unwrap();
+        assert_eq!(chosen.dex_id, "raydium");
     }
 
     #[test]

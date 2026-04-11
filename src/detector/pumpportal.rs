@@ -97,7 +97,7 @@ pub async fn start_pumpportal_listener(
                     }
                 }
             }
-            "migration" => {
+            "migrate" => {
                 if let Some(token_info) = parse_migration_event(&event) {
                     migration_count += 1;
                     info!(
@@ -112,8 +112,14 @@ pub async fn start_pumpportal_listener(
                     }
                 }
             }
-            _ => {
-                // Unknown event type, skip
+            other => {
+                // Unknown event type — log so we notice schema changes.
+                warn!(
+                    tx_type = %other,
+                    keys = ?event.as_object().map(|o| o.keys().collect::<Vec<_>>()),
+                    raw = %event,
+                    "PumpPortal: unknown event dropped"
+                );
             }
         }
     }
@@ -177,21 +183,34 @@ fn parse_create_event(event: &serde_json::Value) -> Option<TokenInfo> {
 /// Allows reliable downstream detection without fragile empty-string checks.
 pub const MIGRATION_EVENT_MARKER: &str = "MIGRATION_EVENT";
 
-/// Parse a PumpPortal "migration" event into TokenInfo.
-/// Sets creator = MIGRATION_EVENT_MARKER so downstream pipelines can
+/// Parse a PumpPortal "migrate" event into TokenInfo.
+///
+/// Production log observation (2026-04): the real event shape is MINIMAL —
+/// only four keys:
+/// ```json
+/// {
+///   "signature": "5ciog1XERjBNiV48MY8UsNrQM4EN3FL7GpA7t9zfmAdQfp…",
+///   "mint":      "2NJbvNWPnwUT2N82nBRVtiiKKG3tWfXaYbeuXMN7pump",
+///   "txType":    "migrate",
+///   "pool":      "pump-amm"
+/// }
+/// ```
+/// No `name`, `symbol`, `solAmount`, `poolAddress`, `marketCapSol`, or
+/// `vSolInBondingCurve`. Downstream consumers (main.rs migration observation
+/// pipeline) must enrich these fields via a separate RPC/HTTP lookup if real
+/// liquidity/mcap numbers are required — this parser stays pure and cheap.
+///
+/// Fields deliberately left at zero/empty:
+/// - `name`, `symbol`: not present in migrate payload.
+/// - `initial_liquidity_sol`, `initial_buy_sol`, `market_cap_sol`,
+///   `v_sol_in_bonding_curve`: not present; enrichment happens later.
+/// - `pool_address`: not present; derive from mint + program PDA if needed.
+///
+/// `creator` is set to MIGRATION_EVENT_MARKER so downstream pipelines can
 /// identify this as a migration vs a fresh launch reliably.
 fn parse_migration_event(event: &serde_json::Value) -> Option<TokenInfo> {
     let mint = event["mint"].as_str()?.to_string();
     let pool = event["pool"].as_str().unwrap_or("pump-amm").to_string();
-
-    // Migration events may have different fields
-    let name = event["name"].as_str().unwrap_or("").to_string();
-    let symbol = event["symbol"].as_str().unwrap_or("").to_string();
-    let sol_amount = event["solAmount"].as_f64().unwrap_or(0.0);
-    let pool_address = event["poolAddress"]
-        .as_str()
-        .or(event["bondingCurveKey"].as_str())
-        .map(|s| s.to_string());
 
     let source = if pool == "raydium" || pool == "raydium-cpmm" {
         TokenSource::Raydium
@@ -201,19 +220,19 @@ fn parse_migration_event(event: &serde_json::Value) -> Option<TokenInfo> {
 
     Some(TokenInfo {
         mint,
-        name,
-        symbol,
+        name: String::new(),
+        symbol: String::new(),
         source,
         creator: MIGRATION_EVENT_MARKER.to_string(),
-        initial_liquidity_sol: sol_amount,
+        initial_liquidity_sol: 0.0,
         initial_liquidity_usd: 0.0,
-        pool_address,
+        pool_address: None,
         metadata_uri: None,
         decimals: 6,
         backend: DetectionBackend::PumpPortal,
-        market_cap_sol: event["marketCapSol"].as_f64().unwrap_or(0.0),
+        market_cap_sol: 0.0,
         v_sol_in_bonding_curve: 0.0,
-        initial_buy_sol: sol_amount,
+        initial_buy_sol: 0.0,
         detected_at: Utc::now(),
     })
 }

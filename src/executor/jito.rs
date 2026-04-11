@@ -107,21 +107,28 @@ pub struct JitoClient {
 }
 
 impl JitoClient {
-    pub fn new(endpoint: &str) -> Self {
+    /// Build a new Jito client.
+    ///
+    /// Returns an error if the endpoint is not HTTPS (HTTP would expose bundle
+    /// data to network eavesdroppers) or if the underlying HTTP client fails
+    /// to build. Callers should handle the error gracefully rather than crash
+    /// the entire bot.
+    pub fn new(endpoint: &str) -> Result<Self> {
         if !endpoint.starts_with("https://") {
-            panic!(
-                "Jito endpoint must use HTTPS (got: '{}').\n\
-                 Using HTTP exposes bundle data to network eavesdropping.",
+            anyhow::bail!(
+                "Jito endpoint must use HTTPS (got: '{}'). \
+                 HTTP exposes bundle data to network eavesdropping.",
                 endpoint
             );
         }
-        Self {
+        let http = reqwest::Client::builder()
+            .timeout(std::time::Duration::from_secs(15))
+            .build()
+            .context("Failed to build Jito HTTP client")?;
+        Ok(Self {
             endpoint: format!("{}/api/v1/bundles", endpoint.trim_end_matches('/')),
-            http: reqwest::Client::builder()
-                .timeout(std::time::Duration::from_secs(15))
-                .build()
-                .expect("Failed to build Jito HTTP client"),
-        }
+            http,
+        })
     }
 
     /// Build a standalone tip transaction that transfers SOL to a random Jito tip account.

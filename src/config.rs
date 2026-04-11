@@ -178,6 +178,27 @@ impl Config {
     pub fn from_env() -> Result<Self> {
         dotenvy::dotenv().ok();
 
+        // Validate critical security settings early — fail fast on misconfig.
+        let wallet_password = env::var("WALLET_PASSWORD")
+            .context("WALLET_PASSWORD is required for wallet encryption")?;
+        if wallet_password.len() < 8 {
+            anyhow::bail!(
+                "WALLET_PASSWORD must be at least 8 characters (got {})",
+                wallet_password.len()
+            );
+        }
+
+        let admin_chat_id: i64 = env::var("TELEGRAM_ADMIN_CHAT_ID")
+            .context("TELEGRAM_ADMIN_CHAT_ID is required — set your Telegram chat ID")?
+            .parse()
+            .context("Invalid TELEGRAM_ADMIN_CHAT_ID (must be integer)")?;
+        if admin_chat_id == 0 {
+            anyhow::bail!(
+                "TELEGRAM_ADMIN_CHAT_ID must be a non-zero integer — \
+                 without it, the Telegram bot would accept commands from anyone"
+            );
+        }
+
         Ok(Self {
             solana_rpc_url: env::var("SOLANA_RPC_URL")
                 .unwrap_or_else(|_| "https://api.mainnet-beta.solana.com".to_string()),
@@ -196,10 +217,7 @@ impl Config {
 
             telegram_bot_token: env::var("TELEGRAM_BOT_TOKEN")
                 .context("TELEGRAM_BOT_TOKEN is required")?,
-            telegram_admin_chat_id: env::var("TELEGRAM_ADMIN_CHAT_ID")
-                .unwrap_or_else(|_| "0".to_string())
-                .parse()
-                .context("Invalid TELEGRAM_ADMIN_CHAT_ID")?,
+            telegram_admin_chat_id: admin_chat_id,
 
             goplus_api_key: env::var("GOPLUS_API_KEY").unwrap_or_default(),
             rugcheck_api_url: env::var("RUGCHECK_API_URL")

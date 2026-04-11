@@ -63,6 +63,27 @@ impl PositionManager {
         price_source: Option<String>,
         wallet_sol_at_open: f64,
     ) -> Result<Position> {
+        // DOUBLE-BUY GUARD: refuse to open a second position on a mint that
+        // already has an Open position. Protects against race conditions
+        // (e.g. detector firing on both PumpPortal + Raydium) and Telegram
+        // double-clicks that would otherwise double our exposure.
+        {
+            let positions = self
+                .positions
+                .read()
+                .map_err(|e| anyhow::anyhow!("Position lock poisoned: {e}"))?;
+            if let Some(existing) = positions.get(token_mint) {
+                if matches!(existing.status, PositionStatus::Open) {
+                    anyhow::bail!(
+                        "Position already open for {} (id={}, entry={} SOL)",
+                        token_mint,
+                        existing.id,
+                        existing.entry_amount_sol
+                    );
+                }
+            }
+        }
+
         let position = Position {
             id: Uuid::new_v4().to_string(),
             token_mint: token_mint.to_string(),

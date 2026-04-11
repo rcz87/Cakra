@@ -62,15 +62,16 @@ impl ExecutorService {
         cooldown: CooldownManager,
         lists: ListManager,
         positions: PositionManager,
-    ) -> Self {
+    ) -> Result<Self> {
         let rpc_url = config.effective_rpc_url().to_string();
         let rpc = Arc::new(RpcClient::new(rpc_url.clone()));
         let sender = HeliusSender::new(&rpc_url);
-        let jito = JitoClient::new(&config.jito_block_engine_url);
+        let jito = JitoClient::new(&config.jito_block_engine_url)
+            .context("Failed to create Jito client")?;
         let jupiter = JupiterClient::new(&config.jupiter_api_url, &config.jupiter_api_key);
         let pumpportal = PumpPortalTradeClient::new();
 
-        Self {
+        Ok(Self {
             config,
             rpc,
             sender,
@@ -82,7 +83,7 @@ impl ExecutorService {
             risk,
             cooldown,
             lists,
-        }
+        })
     }
 
     /// Read wallet SOL balance (in SOL, not lamports). Used as a snapshot

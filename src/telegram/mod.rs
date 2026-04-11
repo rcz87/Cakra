@@ -21,6 +21,7 @@ use tokio::sync::{mpsc, Mutex};
 use crate::config::Config;
 use crate::db::DbPool;
 use crate::executor::ExecutorService;
+use crate::security::ratelimit::RateLimiter;
 use crate::wallet::WalletManager;
 
 /// What the bot is waiting for from the user.
@@ -52,6 +53,12 @@ pub struct BotState {
     pub pending_actions: Arc<Mutex<HashMap<i64, PendingAction>>>,
     /// Kill switch: false = auto-buy paused.
     pub trading_active: Arc<AtomicBool>,
+    /// Per-chat rate limiter for Telegram commands.
+    ///
+    /// Capacity 5 / refill 1 token per second: allows a short burst (e.g.
+    /// quick successive button taps) but refuses sustained spamming that
+    /// could race past the double-buy guard on retry paths.
+    pub rate_limiter: Arc<RateLimiter<i64>>,
 }
 
 pub struct TelegramBot;
@@ -79,6 +86,7 @@ impl TelegramBot {
             executor,
             pending_actions: Arc::new(Mutex::new(HashMap::new())),
             trading_active,
+            rate_limiter: Arc::new(RateLimiter::new(5, 1.0)),
         });
 
         let handler = dptree::entry()

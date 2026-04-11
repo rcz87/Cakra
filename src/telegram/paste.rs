@@ -34,6 +34,22 @@ pub async fn handle_message(
         return Ok(());
     }
 
+    // RATE LIMIT: even authorised users must not be able to spam paste
+    // messages. Each paste of a token address kicks off analyzer work
+    // (RPC calls, security checks, DB writes), so rapid paste can
+    // exhaust resources or rack up API cost. Same token-bucket as
+    // /buy and callbacks: 5 burst, 1/s steady.
+    if !state.rate_limiter.try_acquire(&msg.chat.id.0) {
+        warn!("Rate-limited paste from chat {}", msg.chat.id.0);
+        let _ = bot
+            .send_message(
+                msg.chat.id,
+                "\u{23f3} Terlalu banyak paste. Coba lagi sebentar.",
+            )
+            .await;
+        return Ok(());
+    }
+
     let text = match msg.text() {
         Some(t) => t.trim(),
         None => return Ok(()),

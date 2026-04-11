@@ -63,27 +63,8 @@ impl PositionManager {
         price_source: Option<String>,
         wallet_sol_at_open: f64,
     ) -> Result<Position> {
-        // DOUBLE-BUY GUARD: refuse to open a second position on a mint that
-        // already has an Open position. Protects against race conditions
-        // (e.g. detector firing on both PumpPortal + Raydium) and Telegram
-        // double-clicks that would otherwise double our exposure.
-        {
-            let positions = self
-                .positions
-                .read()
-                .map_err(|e| anyhow::anyhow!("Position lock poisoned: {e}"))?;
-            if let Some(existing) = positions.get(token_mint) {
-                if matches!(existing.status, PositionStatus::Open) {
-                    anyhow::bail!(
-                        "Position already open for {} (id={}, entry={} SOL)",
-                        token_mint,
-                        existing.id,
-                        existing.entry_amount_sol
-                    );
-                }
-            }
-        }
-
+        // Build the new Position BEFORE touching any lock so the write
+        // critical section stays short (check-and-insert only).
         let position = Position {
             id: Uuid::new_v4().to_string(),
             token_mint: token_mint.to_string(),
@@ -115,16 +96,38 @@ impl PositionManager {
             age_secs: 0,
         };
 
-        // Insert into in-memory cache
+        // DOUBLE-BUY GUARD: atomic check-and-insert.
+        //
+        // The check (existing open position for this mint?) and the
+        // insert must happen under the SAME write lock, otherwise a
+        // concurrent caller can slip in between the check and the
+        // insert — a classic TOCTOU race. Window is microseconds but
+        // non-zero under multi-task retry paths, so we close it fully
+        // by holding the write lock across both operations.
+        //
+        // DB persist happens AFTER the lock drops to keep the critical
+        // section short (no I/O under lock).
         {
             let mut positions = self
                 .positions
                 .write()
                 .map_err(|e| anyhow::anyhow!("Position lock poisoned: {e}"))?;
+
+            if let Some(existing) = positions.get(token_mint) {
+                if matches!(existing.status, PositionStatus::Open) {
+                    anyhow::bail!(
+                        "Position already open for {} (id={}, entry={} SOL)",
+                        token_mint,
+                        existing.id,
+                        existing.entry_amount_sol
+                    );
+                }
+            }
+
             positions.insert(token_mint.to_string(), position.clone());
         }
 
-        // Persist to database
+        // Persist to database (no lock held here)
         self.persist_position(&position)?;
 
         info!(

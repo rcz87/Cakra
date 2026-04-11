@@ -249,7 +249,15 @@ async fn deduplicate_tokens(
     mut rx: mpsc::Receiver<TokenInfo>,
     token_sender: mpsc::Sender<TokenInfo>,
 ) {
-    let mut dedup_queue = DeduplicationQueue::with_default_ttl();
+    // Two independent dedup namespaces — newborn create events and migration
+    // events must NOT collide. Prior bug: when a PumpFun token was born and
+    // then migrated within the 5-minute TTL, the migration event hit the
+    // same dedup key and was silently dropped. ~50% of migration events
+    // were lost to this race before the fix. See commit history for detail.
+    //
+    // Each queue keeps its own TTL; cleanup runs for both below.
+    let mut newborn_dedup = DeduplicationQueue::with_default_ttl();
+    let mut migration_dedup = DeduplicationQueue::with_default_ttl();
     let mut pending: HashMap<String, PendingToken> = HashMap::new();
     let mut cleanup_counter: u64 = 0;
 
@@ -279,8 +287,32 @@ async fn deduplicate_tokens(
 
                 let mint = token.mint.clone();
 
+                // ── Migration fast path ────────────────────────────
+                // Migration events are standalone (PumpPortal-only, no
+                // Helius counterpart), so they must bypass the merge
+                // engine entirely. They also live in a dedicated dedup
+                // namespace so they cannot be blocked by a recent newborn
+                // emission for the same mint — which IS the whole point
+                // of this fix.
+                //
+                // Additionally: routing migrations into the `pending`
+                // HashMap would let `merge_token_data` overwrite a
+                // newborn's `creator` field with MIGRATION_EVENT_MARKER
+                // in the rare 250ms merge window — a silent data
+                // corruption bug this early-return also prevents.
+                let is_migration = token.creator
+                    == crate::detector::pumpportal::MIGRATION_EVENT_MARKER;
+                if is_migration {
+                    if migration_dedup.contains(&mint) {
+                        continue;
+                    }
+                    emit_token(token, &mut migration_dedup, &token_sender).await;
+                    continue;
+                }
+
+                // ── Newborn path (unchanged behaviour) ─────────────
                 // Already emitted this mint? Skip.
-                if dedup_queue.contains(&mint) {
+                if newborn_dedup.contains(&mint) {
                     continue;
                 }
 
@@ -299,7 +331,7 @@ async fn deduplicate_tokens(
                     merge_token_data(pending_entry, &token);
 
                     let merged = pending.remove(&mint).unwrap();
-                    emit_token(merged.token, &mut dedup_queue, &token_sender).await;
+                    emit_token(merged.token, &mut newborn_dedup, &token_sender).await;
                 } else {
                     // First source — create pending entry
                     let is_helius = token.backend == DetectionBackend::Helius;
@@ -336,7 +368,7 @@ async fn deduplicate_tokens(
                             elapsed_ms = entry.created_at.elapsed().as_millis() as u64,
                             "Merge window expired, emitting"
                         );
-                        emit_token(entry.token, &mut dedup_queue, &token_sender).await;
+                        emit_token(entry.token, &mut newborn_dedup, &token_sender).await;
                     }
                 }
             }
@@ -344,7 +376,8 @@ async fn deduplicate_tokens(
 
         cleanup_counter += 1;
         if cleanup_counter % 1000 == 0 {
-            dedup_queue.cleanup();
+            newborn_dedup.cleanup();
+            migration_dedup.cleanup();
             // Also clean up very old pending entries (shouldn't happen, but safety)
             let now = tokio::time::Instant::now();
             pending.retain(|_, p| now.duration_since(p.created_at) < Duration::from_secs(10));
@@ -431,5 +464,185 @@ async fn emit_token(
         Err(mpsc::error::TrySendError::Closed(_)) => {
             error!("Token channel closed — analyzer has shut down");
         }
+    }
+}
+
+#[cfg(test)]
+mod dedup_tests {
+    //! Integration tests for `deduplicate_tokens`.
+    //!
+    //! These verify the dedup collision fix: newborn and migration events
+    //! for the same mint live in independent namespaces and must both be
+    //! emitted, rather than the migration being silently dropped.
+
+    use super::*;
+    use crate::detector::pumpportal::MIGRATION_EVENT_MARKER;
+    use crate::models::token::{DetectionBackend, TokenInfo, TokenSource};
+    use chrono::Utc;
+    use tokio::sync::mpsc;
+
+    fn make_newborn(mint: &str) -> TokenInfo {
+        TokenInfo {
+            mint: mint.to_string(),
+            name: "Newborn".to_string(),
+            symbol: "NB".to_string(),
+            source: TokenSource::PumpFun,
+            creator: "Creator111111111111111111111111111111111111".to_string(),
+            initial_liquidity_sol: 14.8,
+            initial_liquidity_usd: 0.0,
+            pool_address: None,
+            metadata_uri: None,
+            decimals: 6,
+            detected_at: Utc::now(),
+            backend: DetectionBackend::PumpPortal,
+            market_cap_sol: 30.0,
+            v_sol_in_bonding_curve: 0.0,
+            initial_buy_sol: 1.0,
+        }
+    }
+
+    fn make_migration(mint: &str) -> TokenInfo {
+        TokenInfo {
+            mint: mint.to_string(),
+            name: String::new(),
+            symbol: String::new(),
+            source: TokenSource::PumpSwap,
+            creator: MIGRATION_EVENT_MARKER.to_string(),
+            initial_liquidity_sol: 0.0,
+            initial_liquidity_usd: 0.0,
+            pool_address: None,
+            metadata_uri: None,
+            decimals: 6,
+            detected_at: Utc::now(),
+            backend: DetectionBackend::PumpPortal,
+            market_cap_sol: 0.0,
+            v_sol_in_bonding_curve: 0.0,
+            initial_buy_sol: 0.0,
+        }
+    }
+
+    /// Collect all tokens emitted on `out_rx` within `timeout`. Returns a
+    /// vector in emission order. Used by every test to drain the channel
+    /// after feeding the dedup task.
+    async fn drain(
+        out_rx: &mut mpsc::Receiver<TokenInfo>,
+        timeout: std::time::Duration,
+    ) -> Vec<TokenInfo> {
+        let mut out = Vec::new();
+        let deadline = tokio::time::Instant::now() + timeout;
+        loop {
+            let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+            if remaining.is_zero() {
+                break;
+            }
+            match tokio::time::timeout(remaining, out_rx.recv()).await {
+                Ok(Some(t)) => out.push(t),
+                Ok(None) => break,
+                Err(_) => break,
+            }
+        }
+        out
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn newborn_then_migration_both_emit() {
+        // REGRESSION TEST: before the fix, a migration event arriving
+        // within 5-minute TTL of a newborn emit for the same mint was
+        // silently dropped at dedup_queue.contains(). This test enforces
+        // that both events now reach the analyzer channel.
+        let (in_tx, in_rx) = mpsc::channel::<TokenInfo>(8);
+        let (out_tx, mut out_rx) = mpsc::channel::<TokenInfo>(8);
+
+        let task = tokio::spawn(async move {
+            deduplicate_tokens(in_rx, out_tx).await;
+        });
+
+        let mint = "TEST_COLLIDE_MINT_11111111111111111111111111";
+        in_tx.send(make_newborn(mint)).await.unwrap();
+        // Wait past the 250ms merge window so the newborn is emitted.
+        tokio::time::sleep(std::time::Duration::from_millis(350)).await;
+        in_tx.send(make_migration(mint)).await.unwrap();
+
+        let emitted = drain(&mut out_rx, std::time::Duration::from_millis(400)).await;
+        drop(in_tx);
+        task.abort();
+
+        assert_eq!(emitted.len(), 2, "expected both newborn AND migration: got {:?}",
+                   emitted.iter().map(|t| &t.creator).collect::<Vec<_>>());
+        // First out must be the newborn (creator != MIGRATION_MARKER)
+        assert_ne!(emitted[0].creator, MIGRATION_EVENT_MARKER);
+        // Second out must be the migration
+        assert_eq!(emitted[1].creator, MIGRATION_EVENT_MARKER);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn duplicate_migration_deduped() {
+        // Migration-specific dedup must still protect against duplicate
+        // PumpPortal migration events for the same mint.
+        let (in_tx, in_rx) = mpsc::channel::<TokenInfo>(8);
+        let (out_tx, mut out_rx) = mpsc::channel::<TokenInfo>(8);
+
+        let task = tokio::spawn(async move {
+            deduplicate_tokens(in_rx, out_tx).await;
+        });
+
+        let mint = "TEST_DUP_MIGRATION_11111111111111111111111111";
+        in_tx.send(make_migration(mint)).await.unwrap();
+        in_tx.send(make_migration(mint)).await.unwrap();
+        in_tx.send(make_migration(mint)).await.unwrap();
+
+        let emitted = drain(&mut out_rx, std::time::Duration::from_millis(200)).await;
+        drop(in_tx);
+        task.abort();
+
+        assert_eq!(emitted.len(), 1, "duplicate migrations must be deduped");
+        assert_eq!(emitted[0].creator, MIGRATION_EVENT_MARKER);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn migration_bypasses_merge_engine() {
+        // A migration event must never land in the `pending` merge HashMap.
+        // Regression guard: the previous code path would feed the migration
+        // into merge_token_data, which promotes its MIGRATION_EVENT_MARKER
+        // creator onto a pending newborn entry (data corruption).
+        //
+        // Sequence: newborn arrives (enters pending), then migration arrives
+        // for the same mint within 250ms merge window. Expected: the newborn
+        // still emits as a newborn (creator untouched), and the migration
+        // emits independently in the migration namespace.
+        let (in_tx, in_rx) = mpsc::channel::<TokenInfo>(8);
+        let (out_tx, mut out_rx) = mpsc::channel::<TokenInfo>(8);
+
+        let task = tokio::spawn(async move {
+            deduplicate_tokens(in_rx, out_tx).await;
+        });
+
+        let mint = "TEST_RACE_MERGE_111111111111111111111111111";
+        let mut newborn = make_newborn(mint);
+        newborn.backend = DetectionBackend::Helius; // force merge window
+        in_tx.send(newborn).await.unwrap();
+        // Send migration BEFORE 250ms merge window closes.
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        in_tx.send(make_migration(mint)).await.unwrap();
+
+        let emitted = drain(&mut out_rx, std::time::Duration::from_millis(500)).await;
+        drop(in_tx);
+        task.abort();
+
+        assert_eq!(emitted.len(), 2, "both events must emit independently");
+        // Find which one is newborn and which is migration — order is not
+        // strictly guaranteed because the migration fast-path runs before
+        // the merge window expires for the newborn.
+        let newborn_out = emitted
+            .iter()
+            .find(|t| t.creator != MIGRATION_EVENT_MARKER)
+            .expect("newborn must be emitted with its original creator");
+        let migration_out = emitted
+            .iter()
+            .find(|t| t.creator == MIGRATION_EVENT_MARKER)
+            .expect("migration must be emitted");
+        assert_ne!(newborn_out.creator, MIGRATION_EVENT_MARKER,
+                   "newborn creator must not be corrupted by merge");
+        assert_eq!(migration_out.creator, MIGRATION_EVENT_MARKER);
     }
 }

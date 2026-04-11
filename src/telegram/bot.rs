@@ -48,6 +48,10 @@ pub enum Command {
 /// Returns `true` if the chat is authorised, `false` otherwise. Unauthorised
 /// messages are logged (at warn level) and silently ignored — we do NOT reply
 /// to avoid leaking bot existence to random users.
+///
+/// Visibility note: `pub(super)` limits callers to the `telegram` module.
+/// If a future entry-point lives outside this module (e.g. a webhook in
+/// another crate area), promote to `pub(crate)`. Do NOT make this `pub`.
 pub(super) fn is_authorized(chat_id: i64, state: &BotState) -> bool {
     let admin = state.config.telegram_admin_chat_id;
     if admin == 0 {

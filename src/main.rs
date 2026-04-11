@@ -429,6 +429,19 @@ async fn main() -> Result<()> {
                         continue;
                     }
 
+                    // ── OBSERVE-ONLY: skip newborn pipeline entirely ────
+                    // Strategy pivoted to migration-only in commit db6f7c0
+                    // (PumpFun newborn winrate 12% — below viability).
+                    // Running the full scoring + execute_buy path for newborns
+                    // in observe-only mode generated ~30-50 fake "AUTO BUY
+                    // Executed!" Telegram alerts per hour and wasted analyzer
+                    // CPU + RPC budget on a deprecated strategy. The migration
+                    // branch above is the only path that still yields useful
+                    // observations in this mode.
+                    if analyzer_config.observe_only {
+                        continue;
+                    }
+
                     // Store token in database (non-migration tokens only)
                     if let Err(e) = db::queries::insert_token(&analyzer_db, &token) {
                         warn!(error = %e, "Failed to store token in database");

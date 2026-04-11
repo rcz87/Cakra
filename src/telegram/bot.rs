@@ -43,6 +43,28 @@ pub enum Command {
     Go,
 }
 
+/// Authorization gate: only the configured admin chat may interact with the bot.
+///
+/// Returns `true` if the chat is authorised, `false` otherwise. Unauthorised
+/// messages are logged (at warn level) and silently ignored — we do NOT reply
+/// to avoid leaking bot existence to random users.
+pub(super) fn is_authorized(chat_id: i64, state: &BotState) -> bool {
+    let admin = state.config.telegram_admin_chat_id;
+    if admin == 0 {
+        // Misconfiguration: admin id not set. Fail closed — reject everyone.
+        warn!("TELEGRAM_ADMIN_CHAT_ID is 0 (unset) — rejecting all incoming chats");
+        return false;
+    }
+    if chat_id != admin {
+        warn!(
+            "Unauthorized Telegram chat {} attempted to use the bot (admin={})",
+            chat_id, admin
+        );
+        return false;
+    }
+    true
+}
+
 /// Entry-point for all recognised commands.
 pub async fn handle_command(
     bot: Bot,
@@ -50,6 +72,19 @@ pub async fn handle_command(
     cmd: Command,
     state: Arc<BotState>,
 ) -> Result<(), teloxide::RequestError> {
+    if !is_authorized(msg.chat.id.0, &state) {
+        return Ok(());
+    }
+    if !state.rate_limiter.try_acquire(&msg.chat.id.0) {
+        warn!("Rate-limited command from chat {}", msg.chat.id.0);
+        let _ = bot
+            .send_message(
+                msg.chat.id,
+                "\u{23f3} Terlalu banyak perintah. Coba lagi sebentar.",
+            )
+            .await;
+        return Ok(());
+    }
     match cmd {
         Command::Start => handle_start(bot, msg, state).await?,
         Command::Help => handle_help(bot, msg).await?,
@@ -85,6 +120,15 @@ pub async fn handle_callback(
         Some(ref m) => m.chat().id,
         None => return Ok(()),
     };
+
+    // AUTHORIZATION: silently drop callbacks from any non-admin chat.
+    if !is_authorized(chat_id.0, &state) {
+        return Ok(());
+    }
+    if !state.rate_limiter.try_acquire(&chat_id.0) {
+        warn!("Rate-limited callback from chat {}", chat_id.0);
+        return Ok(());
+    }
 
     // Route based on prefix
     if data == "menu" {

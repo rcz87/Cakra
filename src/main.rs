@@ -13,7 +13,7 @@ mod wallet;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use teloxide::payloads::SendMessageSetters as _;
 use teloxide::prelude::Requester;
 use tokio::signal;
@@ -111,11 +111,11 @@ async fn main() -> Result<()> {
     }
 
     // ── Wallet Manager (shared for buy/sell) ─────────────────────
+    // NOTE: WALLET_PASSWORD presence + minimum length already validated in
+    // Config::from_env(); this unwrap is safe because the process would have
+    // already exited on missing/weak password.
     let wallet_password = std::env::var("WALLET_PASSWORD")
-        .expect("WALLET_PASSWORD must be set — cannot start without wallet encryption password");
-    if wallet_password.len() < 8 {
-        panic!("WALLET_PASSWORD must be at least 8 characters for wallet security");
-    }
+        .expect("WALLET_PASSWORD validated by Config::from_env");
     let wallet_manager = Arc::new(
         WalletManager::new(&config, db.clone()).expect("Failed to create wallet manager"),
     );
@@ -152,14 +152,17 @@ async fn main() -> Result<()> {
         }
     }
 
-    let executor = Arc::new(ExecutorService::new(
-        Arc::new(config.clone()),
-        db.clone(),
-        RiskManager::new(config.clone(), db.clone()),
-        CooldownManager::new(config.trade_cooldown_secs),
-        ListManager::new(db.clone()),
-        position_manager.clone(),
-    ));
+    let executor = Arc::new(
+        ExecutorService::new(
+            Arc::new(config.clone()),
+            db.clone(),
+            RiskManager::new(config.clone(), db.clone()),
+            CooldownManager::new(config.trade_cooldown_secs),
+            ListManager::new(db.clone()),
+            position_manager.clone(),
+        )
+        .context("Failed to initialize ExecutorService")?,
+    );
 
     // ── Channel: Detector → Analyzer ───────────────────────────
     // DetectorService creates its own internal channel and returns the receiver

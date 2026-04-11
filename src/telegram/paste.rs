@@ -29,6 +29,11 @@ pub async fn handle_message(
     msg: Message,
     state: Arc<BotState>,
 ) -> Result<(), teloxide::RequestError> {
+    // AUTHORIZATION: silently drop messages from any non-admin chat.
+    if !super::bot::is_authorized(msg.chat.id.0, &state) {
+        return Ok(());
+    }
+
     let text = match msg.text() {
         Some(t) => t.trim(),
         None => return Ok(()),

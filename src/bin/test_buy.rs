@@ -71,7 +71,7 @@ async fn main() -> Result<()> {
         cooldown,
         lists,
         positions,
-    );
+    )?;
 
     // ── Pick a test token ─────────────────────────────────────
     // Use WSOL → USDC swap via Jupiter as the simplest test.

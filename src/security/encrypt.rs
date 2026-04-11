@@ -82,8 +82,10 @@ mod tests {
     #[test]
     fn test_wrong_password_fails() {
         let original = b"test-private-key";
-        let encrypted = encrypt_private_key(original, "correct", "salt").unwrap();
-        let result = decrypt_private_key(&encrypted, "wrong", "salt");
+        // Argon2 requires a salt of at least 8 bytes — use a realistic one.
+        let salt = "test-salt-12345678";
+        let encrypted = encrypt_private_key(original, "correct", salt).unwrap();
+        let result = decrypt_private_key(&encrypted, "wrong", salt);
         assert!(result.is_err());
     }
 }

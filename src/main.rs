@@ -300,7 +300,65 @@ async fn main() -> Result<()> {
                             _ => "unknown",
                         };
 
+                        // ── Enrichment via DexScreener ────────────────────
+                        // PumpPortal `migrate` events carry only {mint, pool,
+                        // signature, txType}. We need real liquidity / mcap
+                        // numbers to apply the migration filter. DexScreener
+                        // public API (3s timeout, ~300 req/min limit) is
+                        // cheaper than on-chain PDA derivation + decode and
+                        // our expected rate (~13/hour) is >1000x under the
+                        // rate limit.
+                        //
+                        // market_cap_sol is derived inside the DexScreener
+                        // client from the pair's OWN implied SOL/USD rate
+                        // (priceNative / priceUsd), so we don't depend on
+                        // any external SOL price oracle that could be stale.
+                        //
+                        // On failure: filter_passed = false with an explicit
+                        // "dexscreener: ..." reason — fail closed, never
+                        // trade on unenriched data.
+                        let ds_dex = match pool_str {
+                            "pump-amm" => "pumpswap",
+                            "raydium" => "raydium",
+                            _ => "",
+                        };
+                        let enrichment =
+                            crate::analyzer::dexscreener::fetch_enrichment(
+                                &token.mint,
+                                ds_dex,
+                            )
+                            .await;
+
+                        let (liquidity_sol, market_cap_sol, spot_price_sol, enrichment_ok, enrichment_err) =
+                            match enrichment {
+                                Ok(Some(pair)) => (
+                                    pair.liquidity_quote, // SOL side of the pool
+                                    pair.market_cap_sol,
+                                    pair.price_native,
+                                    true,
+                                    None,
+                                ),
+                                Ok(None) => (
+                                    0.0,
+                                    0.0,
+                                    0.0,
+                                    false,
+                                    Some("dexscreener: no pair".to_string()),
+                                ),
+                                Err(e) => {
+                                    warn!(mint = %token.mint, error = %e, "DexScreener enrichment failed");
+                                    (
+                                        0.0,
+                                        0.0,
+                                        0.0,
+                                        false,
+                                        Some(format!("dexscreener: {}", e)),
+                                    )
+                                }
+                            };
+
                         // ── Migration filters ────────────────────────────
+                        // Filter 0: enrichment must succeed (fail closed)
                         // Filter 1: minimum migration liquidity > 50 SOL
                         // Filter 2: not the "creator buy exactly 3 SOL" launcher pattern
                         //           (heuristic: solAmount close to 3.0 = mass launcher default)
@@ -308,20 +366,23 @@ async fn main() -> Result<()> {
                         let mut filter_passed = true;
                         let mut filter_reason: Option<String> = None;
 
-                        if token.initial_liquidity_sol < 50.0 {
+                        if !enrichment_ok {
+                            filter_passed = false;
+                            filter_reason = enrichment_err.clone();
+                        } else if liquidity_sol < 50.0 {
                             filter_passed = false;
                             filter_reason = Some(format!(
                                 "liquidity {:.1} SOL < 50.0 min",
-                                token.initial_liquidity_sol
+                                liquidity_sol
                             ));
-                        } else if (token.initial_liquidity_sol - 3.0).abs() < 0.1 {
+                        } else if (liquidity_sol - 3.0).abs() < 0.1 {
                             filter_passed = false;
                             filter_reason = Some("default launcher pattern (creator ~3 SOL)".to_string());
-                        } else if token.market_cap_sol > 0.0 && token.market_cap_sol < 350.0 {
+                        } else if market_cap_sol > 0.0 && market_cap_sol < 350.0 {
                             filter_passed = false;
                             filter_reason = Some(format!(
                                 "mcap {:.1} SOL < 350 (incomplete migration)",
-                                token.market_cap_sol
+                                market_cap_sol
                             ));
                         }
 
@@ -329,8 +390,9 @@ async fn main() -> Result<()> {
                             mint = %token.mint,
                             symbol = %token.symbol,
                             pool = %pool_str,
-                            liquidity_sol = token.initial_liquidity_sol,
-                            mcap_sol = token.market_cap_sol,
+                            liquidity_sol,
+                            mcap_sol = market_cap_sol,
+                            enrichment_ok,
                             filter_passed,
                             filter_reason = ?filter_reason,
                             "MIGRATION EVENT observed"
@@ -348,9 +410,9 @@ async fn main() -> Result<()> {
                             combined_score: 0,
                             route_type: "migration".to_string(),
                             expected_output: 0,
-                            market_cap_sol: token.market_cap_sol,
-                            liquidity_sol: token.initial_liquidity_sol,
-                            spot_price_sol: 0.0,
+                            market_cap_sol,
+                            liquidity_sol,
+                            spot_price_sol,
                             wallet_sol_at_observation: 0.0,
                             is_migration: true,
                             migration_pool: Some(pool_str.to_string()),

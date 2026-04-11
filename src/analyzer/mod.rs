@@ -1,5 +1,6 @@
 pub mod authority;
 pub mod creator;
+pub mod dexscreener;
 pub mod entry_confirmation;
 pub mod goplus;
 pub mod honeypot;

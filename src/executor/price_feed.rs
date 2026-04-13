@@ -157,11 +157,13 @@ impl PriceFeed {
         let source_hint = pos.price_source.as_deref().unwrap_or("Jupiter");
         let mint = pos.token_mint.clone();
 
-        // Try the preferred source first
+        // Try the preferred source first.
+        // PumpSwapAMM uses Jupiter — Jupiter routes through PumpSwap natively,
+        // so no dedicated on-chain reader needed.
         let primary = match source_hint {
             "PumpFunBondingCurve" => self.get_pumpfun_price(pos),
             "RaydiumPool" => self.get_raydium_pool_price(pos),
-            _ => self.get_jupiter_price(pos).await,
+            "PumpSwapAMM" | _ => self.get_jupiter_price(pos).await,
         };
 
         if let Ok(update) = primary {

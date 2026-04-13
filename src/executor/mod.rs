@@ -275,10 +275,27 @@ impl ExecutorService {
                 "Buy executed via PumpPortal + Jito"
             );
 
-            // Record position (same as existing flow)
-            let actual_output = self.verify_buy_balance(
+            // Verify on-chain balance before recording position.
+            // If balance check fails 3x, the buy is considered failed —
+            // do NOT open a position or record a trade (phantom position bug).
+            let actual_output = match self.verify_buy_balance(
                 wallet, &token.mint, expected_output
-            ).await.unwrap_or(expected_output);
+            ).await {
+                Ok(bal) => bal,
+                Err(e) => {
+                    error!(
+                        mint = %token.mint,
+                        signature = %signature,
+                        error = %e,
+                        "PumpPortal buy tx sent but token NOT received — refusing to open position"
+                    );
+                    anyhow::bail!(
+                        "Buy tx {} sent but on-chain balance could not be verified: {}. \
+                         Position NOT opened. Check wallet manually.",
+                        signature, e
+                    );
+                }
+            };
 
             // CRITICAL: entry_price is per BASE UNIT to match PriceFeed.
             // Previous bug: divided by 1_000_000 (whole token assumption) which made
@@ -293,7 +310,7 @@ impl ExecutorService {
             let token_source_str = format!("{:?}", token.source);
             let price_source = match token.source {
                 crate::models::token::TokenSource::PumpFun => Some("PumpFunBondingCurve".to_string()),
-                crate::models::token::TokenSource::PumpSwap => Some("RaydiumPool".to_string()),
+                crate::models::token::TokenSource::PumpSwap => Some("PumpSwapAMM".to_string()),
                 _ => Some("Jupiter".to_string()),
             };
 
@@ -636,7 +653,7 @@ impl ExecutorService {
         let token_source_str = format!("{:?}", token.source);
         let price_source = match token.source {
             crate::models::token::TokenSource::PumpFun => Some("PumpFunBondingCurve".to_string()),
-            crate::models::token::TokenSource::PumpSwap => Some("RaydiumPool".to_string()),
+            crate::models::token::TokenSource::PumpSwap => Some("PumpSwapAMM".to_string()),
             crate::models::token::TokenSource::Raydium => Some("RaydiumPool".to_string()),
             _ => Some("Jupiter".to_string()),
         };
@@ -726,18 +743,36 @@ impl ExecutorService {
     }
 
     /// Verify on-chain token balance after a buy, with retries.
+    /// Fibonacci delays (2/3/5/8/13/21s = ~52s total) give PumpSwap
+    /// ATA enough time to propagate through the RPC cluster.
     async fn verify_buy_balance(
         &self,
         wallet: &Keypair,
         mint_str: &str,
-        expected_output: u64,
+        _expected_output: u64,
     ) -> Result<u64> {
-        for attempt in 0..3u32 {
+        const DELAYS_SECS: [u64; 6] = [2, 3, 5, 8, 13, 21];
+
+        for (attempt, delay) in DELAYS_SECS.iter().enumerate() {
             if attempt > 0 {
-                tokio::time::sleep(std::time::Duration::from_secs(1 << attempt)).await;
+                info!(
+                    mint = %mint_str,
+                    attempt = attempt + 1,
+                    delay_secs = delay,
+                    "Balance check retry — waiting for ATA propagation"
+                );
+                tokio::time::sleep(std::time::Duration::from_secs(*delay)).await;
             }
             match self.get_token_balance_for_mint(&wallet.pubkey(), mint_str) {
-                Ok(bal) if bal > 0 => return Ok(bal),
+                Ok(bal) if bal > 0 => {
+                    info!(
+                        mint = %mint_str,
+                        attempt = attempt + 1,
+                        balance = bal,
+                        "Balance verified on-chain"
+                    );
+                    return Ok(bal);
+                }
                 Ok(_) => {
                     warn!(mint = %mint_str, attempt = attempt + 1, "Balance is 0, retrying");
                 }
@@ -747,7 +782,10 @@ impl ExecutorService {
             }
         }
 
-        Ok(expected_output)
+        anyhow::bail!(
+            "Token balance not found after {} retries (~52s) for mint {}",
+            DELAYS_SECS.len(), mint_str
+        )
     }
 
     /// Execute a sell for a given token mint. Sells `amount_pct`% of holdings.

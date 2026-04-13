@@ -386,6 +386,20 @@ pub fn insert_observation(db: &DbPool, obs: &Observation) -> Result<()> {
     Ok(())
 }
 
+/// Check if an observation for the given mint was already recorded
+/// within the last `window_secs` seconds. Used as a dedup guard against
+/// double-instance or duplicate WebSocket events.
+pub fn recent_observation_exists(db: &DbPool, mint: &str, window_secs: i64) -> Result<bool> {
+    let conn = db.lock().unwrap();
+    let cutoff = (chrono::Utc::now() - chrono::Duration::seconds(window_secs)).to_rfc3339();
+    let count: i64 = conn.query_row(
+        "SELECT COUNT(*) FROM observations WHERE mint = ?1 AND observed_at > ?2",
+        params![mint, cutoff],
+        |row| row.get(0),
+    )?;
+    Ok(count > 0)
+}
+
 // ── Stats Queries ──
 
 #[derive(Debug, Clone, Default)]

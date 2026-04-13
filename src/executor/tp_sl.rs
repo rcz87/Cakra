@@ -268,6 +268,25 @@ impl TpSlMonitor {
             );
         }
 
+        // ── Zero/near-zero price guard ─────────────────────────────
+        // If current price is effectively zero (> 99% below entry) AND
+        // position is younger than 120s, the price feed likely returned
+        // garbage (wrong decimals, RPC error, stale cache). Selling on
+        // a phantom -99% wipes real positions. Skip ALL triggers and
+        // wait for a sane price update.
+        if pos.pnl_pct < -95.0 && pos.age_secs < 120 {
+            warn!(
+                mint = %pos.token_mint,
+                symbol = %pos.token_symbol,
+                pnl_pct = pos.pnl_pct,
+                age_secs = pos.age_secs,
+                current_price = pos.current_price_sol,
+                entry_price = pos.entry_price_sol,
+                "Price looks bogus (>95% drop in <120s) — skipping SL, waiting for sane price"
+            );
+            return;
+        }
+
         // Check stop-loss first (highest priority — runs even when stale)
         if pos.should_stop_loss() {
             warn!(
@@ -449,10 +468,27 @@ impl TpSlMonitor {
 pub async fn process_tp_sl_commands(
     mut rx: mpsc::Receiver<TpSlCommand>,
     sell_tx: mpsc::Sender<(String, u8)>, // (mint, sell_pct)
+    positions: super::positions::PositionManager,
 ) {
     info!("TP/SL command processor started");
 
     while let Some(cmd) = rx.recv().await {
+        // Extract mint from command and check if position is still open.
+        // Commands can pile up in the channel while a sell is in progress;
+        // by the time we process them the position may already be closed.
+        let mint_ref = match &cmd {
+            TpSlCommand::TakeProfit { mint, .. }
+            | TpSlCommand::StopLoss { mint, .. }
+            | TpSlCommand::TrailingStop { mint, .. }
+            | TpSlCommand::PartialTakeProfit { mint, .. }
+            | TpSlCommand::TimeStop { mint, .. }
+            | TpSlCommand::MaxAgeExit { mint, .. } => mint.as_str(),
+        };
+        if !positions.is_open(mint_ref) {
+            info!(mint = %mint_ref, "TP/SL command skipped — position already closed");
+            continue;
+        }
+
         match cmd {
             TpSlCommand::TakeProfit { mint, symbol, pnl_pct } => {
                 info!(

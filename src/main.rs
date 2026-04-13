@@ -18,7 +18,7 @@ use teloxide::payloads::SendMessageSetters as _;
 use teloxide::prelude::Requester;
 use tokio::signal;
 use tokio::sync::{broadcast, mpsc};
-use tracing::{error, info, warn};
+use tracing::{debug, error, info, warn};
 
 use crate::config::Config;
 use crate::monitoring::init_logging;
@@ -322,15 +322,70 @@ async fn main() -> Result<()> {
                             "raydium" => "raydium",
                             _ => "",
                         };
-                        let enrichment =
-                            crate::analyzer::dexscreener::fetch_enrichment(
-                                &token.mint,
-                                ds_dex,
-                            )
-                            .await;
+                        // Retry DexScreener with increasing delays.
+                        // Migration events fire instantly but DexScreener
+                        // needs time to index the new pair — first attempt
+                        // almost always returns "no pair". Delays: 30s → 60s → 120s.
+                        const DS_RETRY_DELAYS: [u64; 3] = [30, 60, 120];
+                        let mut enrichment_result: Result<Option<crate::analyzer::dexscreener::EnrichedPair>, anyhow::Error> = Ok(None);
+
+                        for (attempt, delay_secs) in DS_RETRY_DELAYS.iter().enumerate() {
+                            if attempt > 0 {
+                                info!(
+                                    mint = %token.mint,
+                                    attempt = attempt + 1,
+                                    delay_secs,
+                                    "DexScreener retry — waiting for pair to be indexed"
+                                );
+                                tokio::time::sleep(std::time::Duration::from_secs(*delay_secs)).await;
+                            } else {
+                                // First attempt: still wait the initial delay so
+                                // DexScreener has time to index the freshly-created pair.
+                                info!(
+                                    mint = %token.mint,
+                                    delay_secs,
+                                    "DexScreener initial delay before first query"
+                                );
+                                tokio::time::sleep(std::time::Duration::from_secs(*delay_secs)).await;
+                            }
+
+                            enrichment_result =
+                                crate::analyzer::dexscreener::fetch_enrichment(
+                                    &token.mint,
+                                    ds_dex,
+                                )
+                                .await;
+
+                            match &enrichment_result {
+                                Ok(Some(_pair)) => {
+                                    info!(
+                                        mint = %token.mint,
+                                        attempt = attempt + 1,
+                                        "DexScreener pair found"
+                                    );
+                                    break;
+                                }
+                                Ok(None) => {
+                                    warn!(
+                                        mint = %token.mint,
+                                        attempt = attempt + 1,
+                                        max_attempts = DS_RETRY_DELAYS.len(),
+                                        "DexScreener: no pair yet"
+                                    );
+                                }
+                                Err(e) => {
+                                    warn!(
+                                        mint = %token.mint,
+                                        attempt = attempt + 1,
+                                        error = %e,
+                                        "DexScreener fetch error"
+                                    );
+                                }
+                            }
+                        }
 
                         let (liquidity_sol, market_cap_sol, spot_price_sol, enrichment_ok, enrichment_err) =
-                            match enrichment {
+                            match enrichment_result {
                                 Ok(Some(pair)) => (
                                     pair.liquidity_quote, // SOL side of the pool
                                     pair.market_cap_sol,
@@ -343,10 +398,10 @@ async fn main() -> Result<()> {
                                     0.0,
                                     0.0,
                                     false,
-                                    Some("dexscreener: no pair".to_string()),
+                                    Some("dexscreener: timeout after 3 retries".to_string()),
                                 ),
                                 Err(e) => {
-                                    warn!(mint = %token.mint, error = %e, "DexScreener enrichment failed");
+                                    warn!(mint = %token.mint, error = %e, "DexScreener enrichment failed after retries");
                                     (
                                         0.0,
                                         0.0,
@@ -398,6 +453,24 @@ async fn main() -> Result<()> {
                             "MIGRATION EVENT observed"
                         );
 
+                        // Dedup guard: skip insert if this mint was already
+                        // observed in the last 5 minutes (protects against
+                        // double-instance or duplicate WS events).
+                        let dominated = match db::queries::recent_observation_exists(&analyzer_db, &token.mint, 300) {
+                            Ok(exists) => exists,
+                            Err(e) => {
+                                warn!(error = %e, "Dedup check failed, proceeding with insert");
+                                false
+                            }
+                        };
+                        if dominated {
+                            info!(
+                                mint = %token.mint,
+                                "Skipping duplicate migration observation (already recorded within 5 min)"
+                            );
+                            continue;
+                        }
+
                         // Record observation regardless of filter outcome
                         // (so we can analyze rejection patterns later)
                         let observation = db::queries::Observation {
@@ -425,22 +498,142 @@ async fn main() -> Result<()> {
                             warn!(error = %e, "Failed to record migration observation");
                         }
 
-                        // Migration events don't go through normal scoring pipeline
+                        // ── Migration buy execution ─────────────────────
+                        // Only buy when filter passed AND not observe-only.
+                        if !filter_passed {
+                            continue;
+                        }
+
+                        if analyzer_config.observe_only {
+                            info!(
+                                mint = %token.mint,
+                                symbol = %token.symbol,
+                                pool = %pool_str,
+                                liquidity_sol,
+                                mcap_sol = market_cap_sol,
+                                "OBSERVE-ONLY: would buy migration token (skipping)"
+                            );
+                            continue;
+                        }
+
+                        // Kill switch check
+                        if !analyzer_trading_active.load(Ordering::Relaxed) {
+                            info!(
+                                mint = %token.mint,
+                                "Migration buy PAUSED (kill switch active). Use /go to resume."
+                            );
+                            continue;
+                        }
+
+                        info!(
+                            mint = %token.mint,
+                            symbol = %token.symbol,
+                            pool = %pool_str,
+                            liquidity_sol,
+                            mcap_sol = market_cap_sol,
+                            amount_sol = analyzer_config.max_buy_sol,
+                            "MIGRATION BUY → executing"
+                        );
+
+                        match analyzer_wallet.get_active_wallet() {
+                            Ok(Some(active)) => {
+                                match analyzer_wallet.get_keypair(&active.pubkey, &analyzer_password) {
+                                    Ok(keypair) => {
+                                        let amount = analyzer_config.max_buy_sol;
+                                        let slippage = analyzer_config.default_slippage_bps;
+
+                                        match analyzer_executor.execute_buy(
+                                            &token, amount, slippage, &keypair,
+                                        ).await {
+                                            Ok(sig) => {
+                                                info!(
+                                                    mint = %token.mint,
+                                                    signature = %sig,
+                                                    amount_sol = amount,
+                                                    "MIGRATION BUY executed successfully"
+                                                );
+
+                                                let pos = analyzer_positions.get_open_positions()
+                                                    .into_iter()
+                                                    .find(|p| p.token_mint == token.mint);
+
+                                                let (entry_price, tokens_received) = match &pos {
+                                                    Some(p) => (p.entry_price_sol, p.token_amount),
+                                                    None => (0.0, 0.0),
+                                                };
+
+                                                let _ = tg_bot.send_message(
+                                                    tg_chat,
+                                                    format!(
+                                                        "\u{1f680} <b>MIGRATION BUY Executed!</b>\n\
+                                                         \u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\n\n\
+                                                         \u{1f4e6} <b>Token:</b> {} (<code>{}</code>)\n\
+                                                         \u{1f30d} <b>Pool:</b> {}\n\
+                                                         \u{1f4a7} <b>Liquidity:</b> {:.1} SOL\n\
+                                                         \u{1f4ca} <b>MCap:</b> {:.1} SOL\n\
+                                                         \u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\n\
+                                                         \u{1f4b0} <b>Spent:</b> {} SOL\n\
+                                                         \u{1f4b2} <b>Entry Price:</b> {:.10} SOL\n\
+                                                         \u{1f4e6} <b>Received:</b> {:.2} tokens\n\
+                                                         \u{1f4dd} <b>Tx:</b> <code>{}</code>\n\n\
+                                                         <i>TP/SL aktif. Cek /positions</i>",
+                                                        token.symbol, token.mint,
+                                                        pool_str,
+                                                        liquidity_sol,
+                                                        market_cap_sol,
+                                                        amount,
+                                                        entry_price,
+                                                        tokens_received,
+                                                        sig,
+                                                    ),
+                                                ).parse_mode(teloxide::types::ParseMode::Html).await;
+                                            }
+                                            Err(e) => {
+                                                error!(
+                                                    mint = %token.mint,
+                                                    error = %e,
+                                                    "MIGRATION BUY failed"
+                                                );
+                                                error_timestamps.push(tokio::time::Instant::now());
+
+                                                let _ = tg_bot.send_message(
+                                                    tg_chat,
+                                                    format!(
+                                                        "\u{274c} <b>MIGRATION BUY Failed</b>\n\n\
+                                                         \u{1f4e6} <b>Token:</b> {} (<code>{}</code>)\n\
+                                                         \u{1f30d} <b>Pool:</b> {}\n\
+                                                         \u{1f4b0} <b>Amount:</b> {} SOL\n\
+                                                         \u{26a0}\u{fe0f} <b>Error:</b> {}",
+                                                        token.symbol, token.mint,
+                                                        pool_str,
+                                                        amount,
+                                                        e,
+                                                    ),
+                                                ).parse_mode(teloxide::types::ParseMode::Html).await;
+                                            }
+                                        }
+                                    }
+                                    Err(e) => {
+                                        error!(error = %e, "Failed to decrypt wallet for migration buy");
+                                    }
+                                }
+                            }
+                            Ok(None) => {
+                                warn!("No active wallet — cannot execute migration buy");
+                            }
+                            Err(e) => {
+                                error!(error = %e, "Failed to get active wallet for migration buy");
+                            }
+                        }
+
                         continue;
                     }
 
-                    // ── OBSERVE-ONLY: skip newborn pipeline entirely ────
-                    // Strategy pivoted to migration-only in commit db6f7c0
-                    // (PumpFun newborn winrate 12% — below viability).
-                    // Running the full scoring + execute_buy path for newborns
-                    // in observe-only mode generated ~30-50 fake "AUTO BUY
-                    // Executed!" Telegram alerts per hour and wasted analyzer
-                    // CPU + RPC budget on a deprecated strategy. The migration
-                    // branch above is the only path that still yields useful
-                    // observations in this mode.
-                    if analyzer_config.observe_only {
-                        continue;
-                    }
+                    // ── SKIP NEWBORN PIPELINE (permanently disabled) ────
+                    // PumpFun newborn winrate 12% (commit db6f7c0) — below
+                    // viability threshold. Strategy is migration-only now.
+                    // Newborn tokens never reach scoring or buy execution.
+                    continue;
 
                     // Store token in database (non-migration tokens only)
                     if let Err(e) = db::queries::insert_token(&analyzer_db, &token) {
@@ -768,9 +961,10 @@ async fn main() -> Result<()> {
 
     // ── Spawn TP/SL Command Processor ──────────────────────────
     let bot_sell_tx = sell_tx.clone();
+    let tpsl_cmd_positions = position_manager.clone();
     let tpsl_cmd_handle = tokio::spawn(async move {
         info!("TP/SL command processor starting...");
-        process_tp_sl_commands(tpsl_command_rx, sell_tx).await;
+        process_tp_sl_commands(tpsl_command_rx, sell_tx, tpsl_cmd_positions).await;
     });
 
     // ── Spawn Sell Executor ────────────────────────────────────
@@ -783,6 +977,12 @@ async fn main() -> Result<()> {
     let sell_handle = tokio::spawn(async move {
         info!("Sell executor starting...");
         while let Some((mint, sell_pct)) = sell_rx.recv().await {
+            // Guard: skip sell if position is already closed (prevents infinite
+            // retry loop when TP/SL monitor queues commands faster than we drain).
+            if !sell_positions.is_open(&mint) {
+                debug!(mint = %mint, "Sell skipped — position already closed");
+                continue;
+            }
             info!(mint = %mint, sell_pct = sell_pct, "Processing sell command");
 
             // Get active wallet keypair for selling
